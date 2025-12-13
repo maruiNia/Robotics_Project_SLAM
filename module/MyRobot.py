@@ -2,6 +2,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union, Dict, Any
 
+from MySensor import Circle_Sensor
+
 Number = Union[int, float]
 
 
@@ -56,8 +58,11 @@ class Moblie_robot:
         position: Optional[Sequence[Number]] = None,
         velocity: Optional[Sequence[Number]] = None,
         steering: Optional[Sequence[Number]] = None,
+        dynamic_operation_mode : bool = False,
         update_rate: int = 1000,
-    ):
+        sensor: Optional[Circle_Sensor] = None,
+        collision_dist : float = 1e-6,
+        ):
         _check_dim(dim)
         _check_ns(update_rate, "update_rate")
 
@@ -97,7 +102,13 @@ class Moblie_robot:
             "steering": self._steering,
             "orientation": self._orientation,
         }
-
+    
+    # ----------------------
+    # setters
+    # ----------------------
+    def set_sensor(self, sensor: Circle_Sensor) -> None:
+        self._sensor = sensor
+    
     # ----------------------
     # instruction APIs
     # ----------------------
@@ -114,7 +125,11 @@ class Moblie_robot:
             velocity=None if velocity is None else _vec(self.dim, velocity, "velocity"),
             steering=None if steering is None else _vec(self.dim, steering, "steering"),
         )
-        self._queue.append(cmd)
+        if not self.dynamic_operation_mode:
+            self._queue.append(cmd)
+        else:
+            # 동적 명령 처리 모드에서는 즉시 적용
+            self._apply_set(cmd)
 
     def ins_acc_mov(
         self,
@@ -140,7 +155,19 @@ class Moblie_robot:
             steering=None if steering is None else _vec(self.dim, steering, "steering"),
             time_ns=time,
         )
-        self._queue.append(cmd)
+
+        if not self.dynamic_operation_mode:
+            self._queue.append(cmd)
+        else:
+            # 동적 명령 처리 모드에서는 즉시 적용
+            self._apply_acc(cmd)
+
+    def sensing(self) -> Any:
+        """센서로 현재 위치에서 주변 환경을 센싱."""
+        if not hasattr(self, '_sensor') or self._sensor is None:
+            raise RuntimeError("센서가 설정되지 않았습니다.")
+        
+        return self._sensor.sensing(self._position)
 
     # ----------------------
     # simulation core
@@ -207,6 +234,18 @@ class Moblie_robot:
             elapsed += dt
             self._step(dt, note="acc")
 
+    def is_collision(self) -> bool:
+        """현재 위치에서 센서로 충돌 판정."""
+        sensing_results = self.sensing()
+
+        # sensing 결과 중 하나라도 0에 매우 가까우면 충돌로 간주
+        for dist in sensing_results:
+            if dist is not None and dist <= 1e-6:
+                return True
+        return False
+
+    
+
     def start(self) -> List[Dict[str, Any]]:
         """
         로봇을 작동시킨다.
@@ -217,13 +256,23 @@ class Moblie_robot:
         if not self._log:
             self._snapshot(note="start")
 
-        while self._queue:
-            cmd = self._queue.pop(0)
-            if cmd.kind == "set":
-                self._apply_set(cmd)
-            elif cmd.kind == "acc":
-                self._apply_acc(cmd)
-            else:
-                raise RuntimeError(f"알 수 없는 명령: {cmd.kind}")
+        # 테스트 코드
+        if not self.dynamic_operation_mode:
+            while self._queue:
+                cmd = self._queue.pop(0)
+                if cmd.kind == "set":
+                    self._apply_set(cmd)
+                elif cmd.kind == "acc":
+                    self._apply_acc(cmd)
+                else:
+                    raise RuntimeError(f"알 수 없는 명령: {cmd.kind}")
+        else:
+            '''
+            동적 명령 처리 모드
+            로봇이 센싱값 주기적으로 받아서 그에 따라 움직임
+            1. 센싱값 받아오기
+            2. 센싱값에 따라 명령 생성 및 즉시 처리
+            
+            '''
 
         return self._log
