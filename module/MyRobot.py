@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union, Dict, Any
 
-from MySensor import Circle_Sensor
+from .MySensor import Circle_Sensor
 
 Number = Union[int, float]
 
@@ -25,13 +25,13 @@ def _check_ns(ns: int, name: str):
     if not isinstance(ns, int) or ns <= 0:
         raise ValueError(f"{name}는 1 이상의 정수(ns)여야 합니다.")
 
-
 @dataclass
 class _Command:
     kind: str  # "set" or "acc"
     position: Optional[Tuple[float, ...]] = None
     velocity: Optional[Tuple[float, ...]] = None
     steering: Optional[Tuple[float, ...]] = None
+    sensing: Optional[Tuple[float, ...]] = None
     time_ns: int = 0  # acc에서만 사용
 
 
@@ -59,6 +59,7 @@ class Moblie_robot:
         velocity: Optional[Sequence[Number]] = None,
         steering: Optional[Sequence[Number]] = None,
         dynamic_operation_mode : bool = False,
+        sensing_mode : bool = False,
         update_rate: int = 1000,
         sensor: Optional[Circle_Sensor] = None,
         collision_dist : float = 1e-6,
@@ -70,6 +71,10 @@ class Moblie_robot:
         self._position: Tuple[float, ...] = _vec(dim, position, "position")
         self._velocity: Tuple[float, ...] = _vec(dim, velocity, "velocity")
         self._steering: Tuple[float, ...] = _vec(dim, steering, "steering")
+        self._sensor: Optional[Circle_Sensor] = sensor
+        self._collision_dist: float = collision_dist
+        self._dynamic_operation_mode : bool = dynamic_operation_mode
+        self._sensing_mode : bool = sensing_mode
 
         # orientation은 "방향"이니까 steering을 적분해서 얻는 값으로 하나 둠(벡터로)
         self._orientation: Tuple[float, ...] = tuple(0.0 for _ in range(dim))
@@ -119,13 +124,21 @@ class Moblie_robot:
         steering: Optional[Sequence[Number]] = None,
     ) -> None:
         """즉시 설정 명령을 큐에 넣음. None은 유지."""
+        # 동적 명령 처리 모드에서는 센싱값도 포함
+        sensing = None
+        if self._sensing_mode: # 센싱 모드가 켜져 있다면 활성화
+            sensing = self.sensing()
+
         cmd = _Command(
             kind="set",
             position=None if position is None else _vec(self.dim, position, "position"),
             velocity=None if velocity is None else _vec(self.dim, velocity, "velocity"),
             steering=None if steering is None else _vec(self.dim, steering, "steering"),
+            sensing=None if sensing is None else _vec(self.dim, sensing, "sensing"),
         )
-        if not self.dynamic_operation_mode:
+
+        #동작 모드
+        if not self._dynamic_operation_mode:
             self._queue.append(cmd)
         else:
             # 동적 명령 처리 모드에서는 즉시 적용
@@ -148,15 +161,22 @@ class Moblie_robot:
           update_rate=500ns, time=1000ns, velocity=1(m/s 증가 목표), 초기 v=0이면
             0 -> (500ns) 0.5 -> (1000ns) 1.0  처럼 선형으로 증가
         """
+
+        #센싱 모드
+        sensing = None
+        if self._sensing_mode:
+            sensing = self.sensing()
+        
         _check_ns(time, "time")
         cmd = _Command(
             kind="acc",
             velocity=None if velocity is None else _vec(self.dim, velocity, "velocity"),
             steering=None if steering is None else _vec(self.dim, steering, "steering"),
+            sensing=None if sensing is None else _vec(self.dim, sensing, "sensing"),
             time_ns=time,
         )
 
-        if not self.dynamic_operation_mode:
+        if not self._dynamic_operation_mode:
             self._queue.append(cmd)
         else:
             # 동적 명령 처리 모드에서는 즉시 적용
@@ -240,7 +260,7 @@ class Moblie_robot:
 
         # sensing 결과 중 하나라도 0에 매우 가까우면 충돌로 간주
         for dist in sensing_results:
-            if dist is not None and dist <= 1e-6:
+            if dist is not None and dist <= self._collision_dist:
                 return True
         return False
 
@@ -257,7 +277,7 @@ class Moblie_robot:
             self._snapshot(note="start")
 
         # 테스트 코드
-        if not self.dynamic_operation_mode:
+        if not self._dynamic_operation_mode:
             while self._queue:
                 cmd = self._queue.pop(0)
                 if cmd.kind == "set":
