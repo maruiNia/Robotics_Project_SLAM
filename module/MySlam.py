@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
 from .MyUtils import _vec, _check_dim, _to_tuple
-from typing import List, Sequence, Tuple, Optional, Union
+from typing import List, Sequence, Tuple, Optional, Union, Set
 
 Number = Union[int, float]
 Point = Union[Tuple[Number, ...], List[Number]]
@@ -241,8 +241,12 @@ def maze_map(
 
     return m
 
-def print_map_plt(slam_map: SlamMap, robot = None):
-    """matplotlib으로 SlamMap 시각화."""
+def print_map_plt(slam_map, path=None, expanded_walls=None, *, show=True, robot=None):
+    """
+    matplotlib으로 SlamMap 시각화.
+    - path: [(x,y), (x,y), ...] 형태의 '월드 좌표' 경로를 같이 그림
+    - expanded_walls: [(x,y), ...] 형태의 확장벽 좌표(정수/실수 모두 가능)를 점으로 표시
+    """
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
 
@@ -292,7 +296,20 @@ def print_map_plt(slam_map: SlamMap, robot = None):
         ex, ey = slam_map.end_point
         ax.plot(ex, ey, marker='x', color='blue', label='End')
 
-    #로봇이 주어지면 로봇 위치 그리기
+    # ✅ 확장 벽(Inflated walls) 그리기: 점 표시
+    if expanded_walls is not None and len(expanded_walls) > 0:
+        xs = [float(p[0]) for p in expanded_walls]
+        ys = [float(p[1]) for p in expanded_walls]
+        ax.scatter(xs, ys, s=12, alpha=0.35, color='dodgerblue', label='Expanded Walls')
+
+    # ✅ 경로 그리기
+    if path is not None and len(path) > 0:
+        px = [float(p[0]) for p in path]
+        py = [float(p[1]) for p in path]
+        ax.plot(px, py, linewidth=2, color='orange', label='A* Path')
+        ax.scatter(px, py, s=18, color='orange', alpha=0.9)
+
+    # 로봇이 주어지면 로봇 위치 그리기
     if robot is not None:
         rx, ry = robot.get_position()
         ax.plot(rx, ry, marker='^', color='orange', label='Robot')
@@ -301,5 +318,45 @@ def print_map_plt(slam_map: SlamMap, robot = None):
     plt.xlabel('X')
     plt.ylabel('Y')
     plt.grid(True)
-    plt.legend()
-    plt.show()
+
+    # label 중복 제거(Obstacle이 여러 번 들어가서)
+    handles, labels = ax.get_legend_handles_labels()
+    uniq = dict(zip(labels, handles))
+    ax.legend(uniq.values(), uniq.keys())
+
+    if show:
+        plt.show()
+
+    return fig, ax
+
+def get_expanded_wall_points(
+    slam_map,
+    expansion: int
+) -> List[Tuple[int, int]]:
+    """
+    SlamMap 내 장애물 + 벽을 expansion 만큼 확장한
+    '벽 좌표 리스트'를 반환한다.
+
+    반환 좌표는 (int, int) 격자 좌표이며,
+    A*에서 이동 불가 노드로 사용 가능.
+    """
+
+    if expansion < 1:
+        raise ValueError("expansion은 1 이상의 자연수여야 합니다.")
+
+    wall_points: Set[Tuple[int, int]] = set()
+
+    for obs in slam_map.get_obs_list():
+        (min_x, min_y), (max_x, max_y) = obs.bounds()
+
+        # 격자 기준으로 확장
+        ix_min = int(min_x) - expansion
+        iy_min = int(min_y) - expansion
+        ix_max = int(max_x) + expansion
+        iy_max = int(max_y) + expansion
+
+        for x in range(ix_min, ix_max + 1):
+            for y in range(iy_min, iy_max + 1):
+                wall_points.add((x, y))
+
+    return list(wall_points)

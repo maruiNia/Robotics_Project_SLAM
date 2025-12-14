@@ -7,6 +7,7 @@ from .MySensor import Circle_Sensor
 from .MyPlanning import PIDVec, point_to_path_min_distance_nd
 from .MyControl import MotionModel, SimpleBicycleModel
 from .MyUtils import _vec, _check_dim, _wrap_pi
+from .MySlam import SlamMap
 
 Number = Union[int, float]
 
@@ -61,6 +62,7 @@ class Moblie_robot:
         sensor: Optional[Circle_Sensor] = None,
         collision_dist : float = 1e-6,
         error_control : PIDVec = None, # 오차 제어용 PID(기본값 내부 구현)
+        end_point : Optional[Tuple[Number, ...]] = None,
         ):
         _check_dim(dim)
         _check_ns(update_rate, "update_rate")
@@ -72,11 +74,16 @@ class Moblie_robot:
         self._sensor: Optional[Circle_Sensor] = sensor
         self._collision_dist: float = collision_dist
         self._dynamic_operation_mode : bool = dynamic_operation_mode
-        self._sensing_mode : bool = sensing_mode
+        self._sensing_mode : bool = sensing_mode 
         self._active_acc: Optional[_ActiveAcc] = None # 동적 모드에서 "진행중인 acc 명령"을 들고 있을 상태
         self._last_sensing: Optional[Tuple[float, ...]] = None # 마지막 센싱(로그/디버깅용)
         self.pid_control : PIDVec = PIDVec(dim = dim, kp = 1.0, ki = 0.0, kd = 0.1) if error_control is None else error_control
         self._motion_model : Optional[MotionModel] = None #운동 모델
+        self._end_point : Optional[Tuple[Number, ...]] = _vec(dim, end_point, "end_point") if end_point is not None else None
+
+        #맵 테스트 모드 - False = 센서 ON(맵 모름, 내 위치 모름), True = 센서 OFF(맵 알고 내 위치도 앎)
+        self._test_map_mode : bool = False
+        self._test_SlamMap = None #테스트용 맵 객체
 
         #동적 명령 처리
         self._path = None #추적할 경로
@@ -116,6 +123,8 @@ class Moblie_robot:
     def get_orientation(self) -> Tuple[float, ...]:
         return self._orientation
     
+    def get_end_point(self) -> Optional[Tuple[float, ...]]:
+        return self._end_point
     # ----------------------
     # setters
     # ----------------------
@@ -136,6 +145,11 @@ class Moblie_robot:
     def set_motion_model(self, model: Optional[MotionModel]) -> None:
         """조향/이동 갱신을 담당할 motion model을 설정. None이면 기존 Euler 방식."""
         self._motion_model = model
+
+    def set_test_map_mode(self, mode: bool, test_map: Optional[SlamMap] = None) -> None:
+        """맵 테스트 모드 설정."""
+        self._test_map_mode = mode
+        self._test_SlamMap = test_map
 
     # ----------------------
     # instruction APIs

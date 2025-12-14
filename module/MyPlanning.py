@@ -265,7 +265,6 @@ class PIDVec:
 
         return u
 
-
 def compute_e_perp_nd(p, path, seg_i, q):
     """
     p: 현재 위치(dim)
