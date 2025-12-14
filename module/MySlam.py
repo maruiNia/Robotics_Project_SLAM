@@ -1,16 +1,11 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
+from .MyUtils import _vec, _check_dim, _to_tuple
+from typing import List, Sequence, Tuple, Optional, Union
 
 Number = Union[int, float]
 Point = Union[Tuple[Number, ...], List[Number]]
-
-
-def _to_tuple(seq: Sequence[Number], dim: int, name: str) -> Tuple[Number, ...]:
-    if len(seq) != dim:
-        raise ValueError(f"{name} 길이가 dim({dim})과 다릅니다. (len={len(seq)})")
-    return tuple(seq)
-
 
 @dataclass
 class Obstacle_obj:
@@ -104,6 +99,8 @@ class SlamMap:
         dim: int,
         limit: Optional[Tuple[Sequence[Number], Sequence[Number]]] = None,
         limit_outside_is_wall: bool = False,
+        start_point : Optional[Sequence[Number]] = None,
+        end_point : Optional[Sequence[Number]] = None,
     ):
         if dim <= 0:
             raise ValueError("dim은 1 이상의 정수여야 합니다.")
@@ -111,6 +108,8 @@ class SlamMap:
         self._obs: List[Obstacle_obj] = []
         self.limit: Optional[Tuple[Tuple[Number, ...], Tuple[Number, ...]]] = None
         self.limit_outside_is_wall: bool = limit_outside_is_wall
+        self.start_point = start_point
+        self.end_point = end_point
 
         if limit is not None:
             self.set_limit(limit)
@@ -168,3 +167,134 @@ class SlamMap:
             "obstacle_count": len(self._obs),
             "obstacles": [repr(o) for o in self._obs],
         }
+
+def maze_map(
+    grid: Sequence[Sequence[int]],
+    start: Tuple[int, int],
+    end: Tuple[int, int],
+    cell_size: Union[int, float] = 1,
+    *,
+    wall_value: int = 1,
+    limit_outside_is_wall: bool = True,
+) -> SlamMap:
+    """
+    2D 미로 배열(grid)과 시작/도착 (격자좌표), cell_size를 받아 SlamMap 객체를 생성해 반환한다.
+
+    - grid: row-major (grid[y][x])
+      예) 3행 6열이면 grid는 길이 3, 각 row는 길이 6
+    - start, end: (x, y) in grid cell index
+    - cell_size: 한 셀 한 변의 길이 (실제 좌표 스케일)
+    - wall_value: 벽으로 간주할 값(기본 1)
+    - limit_outside_is_wall: limit 밖을 벽 처리할지 여부(기본 True)
+
+    반환:
+      SlamMap(dim=2, limit=미로 외벽 범위, 장애물=벽 셀들)
+      start_point, end_point는 "셀 중심 실제좌표"로 저장됨.
+    """
+    if cell_size <= 0:
+        raise ValueError("cell_size는 0보다 커야 합니다.")
+
+    if not grid or not grid[0]:
+        raise ValueError("grid가 비어있습니다.")
+
+    height = len(grid)
+    width = len(grid[0])
+
+    # 행 길이 검증(직사각 배열인지)
+    for y, row in enumerate(grid):
+        if len(row) != width:
+            raise ValueError(f"grid는 직사각형이어야 합니다. (row {y} 길이 불일치)")
+
+    def _in_bounds(pt: Tuple[int, int]) -> bool:
+        x, y = pt
+        return 0 <= x < width and 0 <= y < height
+
+    if not _in_bounds(start):
+        raise ValueError(f"start {start}가 grid 범위를 벗어났습니다.")
+    if not _in_bounds(end):
+        raise ValueError(f"end {end}가 grid 범위를 벗어났습니다.")
+
+    # 맵 limit: 미로 외벽(전체 영역)
+    limit = ((0, 0), (width * cell_size, height * cell_size))
+
+    # start/end를 셀 중심 실제좌표로 변환
+    sx, sy = start
+    ex, ey = end
+    start_point = ((sx + 0.5) * cell_size, (sy + 0.5) * cell_size)
+    end_point   = ((ex + 0.5) * cell_size, (ey + 0.5) * cell_size)
+
+    m = SlamMap(
+        dim=2,
+        limit=limit,
+        limit_outside_is_wall=limit_outside_is_wall,
+        start_point=start_point,
+        end_point=end_point,
+    )
+
+    # 벽(1) 셀들을 장애물로 추가: 각 셀을 하나의 Obstacle_obj로
+    for y in range(height):
+        for x in range(width):
+            if grid[y][x] == wall_value:
+                mn = (x * cell_size, y * cell_size)
+                mx = ((x + 1) * cell_size, (y + 1) * cell_size)
+                m.add(Obstacle_obj(dim=2, min_corner=mn, max_corner=mx))
+
+    return m
+
+def print_map_plt(slam_map: SlamMap):
+    """matplotlib으로 SlamMap 시각화."""
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+
+    if slam_map.dim != 2:
+        raise ValueError("print_map_plt는 2D 맵만 지원합니다.")
+
+    fig, ax = plt.subplots()
+    ax.set_aspect('equal')
+
+    # 맵 limit 그리기
+    if slam_map.limit is not None:
+        (lx0, ly0), (lx1, ly1) = slam_map.limit
+        ax.add_patch(
+            patches.Rectangle(
+                (lx0, ly0),
+                lx1 - lx0,
+                ly1 - ly0,
+                linewidth=1,
+                edgecolor='black',
+                facecolor='none',
+                label='Map Limit'
+            )
+        )
+
+    # 장애물 그리기
+    for obs in slam_map.get_obs_list():
+        (mx0, my0), (mx1, my1) = obs.bounds()
+        ax.add_patch(
+            patches.Rectangle(
+                (mx0, my0),
+                mx1 - mx0,
+                my1 - my0,
+                linewidth=1,
+                edgecolor='red',
+                facecolor='gray',
+                alpha=0.5,
+                label='Obstacle'
+            )
+        )
+
+    # 시작/도착점 그리기
+    if slam_map.start_point is not None:
+        sx, sy = slam_map.start_point
+        ax.plot(sx, sy, marker='o', color='green', label='Start')
+
+    if slam_map.end_point is not None:
+        ex, ey = slam_map.end_point
+        ax.plot(ex, ey, marker='x', color='blue', label='End')
+
+    plt.title('SlamMap Visualization')
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.grid(True)
+    plt.legend()
+    plt.show()

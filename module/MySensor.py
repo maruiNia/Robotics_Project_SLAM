@@ -4,6 +4,8 @@ from typing import Callable, List, Optional, Sequence, Tuple, Union
 import math
 import random
 
+from .MyUtils import _vec, _check_dim
+
 Number = Union[int, float]
 
 

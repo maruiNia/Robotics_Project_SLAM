@@ -2,8 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union, Dict, Any
 
-from .MySensor import Circle_Sensor
-
 Number = Union[int, float]
 
 def _vec(dim: int, value: Optional[Sequence[Number]], name: str) -> Tuple[float, ...]:
