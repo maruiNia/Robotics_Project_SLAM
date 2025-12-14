@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union, Dict, Any
+import math
 
 Number = Union[int, float]
 
@@ -22,3 +23,5 @@ def _to_tuple(seq: Sequence[Number], dim: int, name: str) -> Tuple[Number, ...]:
         raise ValueError(f"{name} 길이가 dim({dim})과 다릅니다. (len={len(seq)})")
     return tuple(seq)
 
+def _wrap_pi(a: float) -> float:
+    return (a + math.pi) % (2 * math.pi) - math.pi

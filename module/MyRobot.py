@@ -1,11 +1,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union, Dict, Any
+import math
 
 from .MySensor import Circle_Sensor
-from .MyPlanning import PIDVec
+from .MyPlanning import PIDVec, point_to_path_min_distance_nd
 from .MyControl import MotionModel, SimpleBicycleModel
-from .MyUtils import _vec, _check_dim
+from .MyUtils import _vec, _check_dim, _wrap_pi
 
 Number = Union[int, float]
 
@@ -494,3 +495,135 @@ class Moblie_robot:
         self._dynamic_operation_mode = True
         self._active_acc = None
         
+    # ----------------------
+    # 계산
+    # ----------------------
+    def _pid_scalar(self, err: float, dt_s: float) -> float:
+        """
+        PIDVec는 e를 'Sequence[float]'로 받는다.
+        따라서 스칼라 err를 (err, 0, 0, ...) 벡터로 확장해서 넣고
+        출력 u[0]만 사용한다.
+        """
+        pid = self.pid_control
+
+        # PIDVec.dim 기준으로 에러 벡터 구성
+        e_vec = [0.0] * getattr(pid, "dim", 1)
+        e_vec[0] = float(err)
+
+        # PIDVec는 step(e, dt)가 정식 인터페이스
+        out = pid.step(e_vec, float(dt_s))
+
+        # out도 벡터이므로 첫 성분만 사용
+        return float(out[0])
+
+    def _signed_cross_track_error_2d(self, pos, closest, seg_i, path):
+        """
+        2D에서 cross-track error에 부호 부여:
+        segment 방향 벡터와 (closest->pos) 벡터의 z-크로스 부호로 좌/우를 판단.
+        """
+        x, y = pos
+        cx, cy = closest
+
+        # segment 방향: path[seg_i] -> path[seg_i+1]
+        i = max(0, min(seg_i, len(path) - 2))
+        x0, y0 = path[i]
+        x1, y1 = path[i + 1]
+        sx, sy = (x1 - x0, y1 - y0)
+
+        # normal 판정용 벡터: closest -> pos
+        ex, ey = (x - cx, y - cy)
+
+        # 2D cross product z = s x e = sx*ey - sy*ex
+        cross_z = sx * ey - sy * ex
+
+        # 부호: cross_z > 0이면 왼쪽, <0이면 오른쪽(좌표계 기준)
+        sign = -1.0 if cross_z >= 0 else 1.0
+
+        # 거리 크기
+        dx = x - cx
+        dy = y - cy
+        dist = math.hypot(dx, dy)
+
+        return sign * dist
+
+    def run_dynamic_path_follow(
+        self,
+        model,
+        *,
+        v_ref: float = 1.0,
+        dt_ns: int = None,
+        goal_tolerance: float = 0.25,
+        max_steps: int = 5000,
+        steer_limit: float = 2.5,
+        use_heading_term: bool = True,
+        heading_gain: float = 1.0,
+    ):
+        """
+        ✅ dynamic_operation을 실제로 쓰는 '제어 루프' 실행기.
+        - 매 tick마다:
+          1) 현재 위치 -> 경로에서 closest point 계산
+          2) cross-track error(부호 포함) 계산
+          3) PID로 steering(각속도) 생성
+          4) (선택) heading error도 같이 섞어서 안정화
+          5) 모델로 1 step 적분
+        - 목표: path의 마지막 점 근처(goal_tolerance) 도달하면 종료
+        """
+        if self._path is None:
+            raise RuntimeError("추적할 경로가 없습니다. 먼저 robot.set_path(s_path)를 호출하세요.")
+
+        if dt_ns is None:
+            dt_ns = self._update_rate_ns
+
+        self.dynamic_operation()         # 모드 ON :contentReference[oaicite:3]{index=3}
+        self.set_motion_model(model)     # 모델 사용 :contentReference[oaicite:4]{index=4}
+
+        # 시작 스냅샷
+        if not self._log:
+            self._snapshot(note="start(dynamic-path-follow)")
+
+        goal = self._path[-1]
+
+        for _ in range(max_steps):
+            x, y = self._position[0], self._position[1]
+
+            # 1) closest point
+            dmin, closest, seg_i, tparam = point_to_path_min_distance_nd([x, y], self._path)
+
+            # 2) signed cross-track error
+            cte = self._signed_cross_track_error_2d((x, y), closest, seg_i, self._path)
+
+            # 3) PID -> steering rate(스칼라)
+            dt_s = dt_ns * 1e-9
+            steer_pid = self._pid_scalar(cte, dt_s)
+
+            # 4) heading term(선택): segment 방향을 바라보게 만들어서 코너에서 덜 흔들리게
+            steer_heading = 0.0
+            if use_heading_term:
+                i = max(0, min(seg_i, len(self._path) - 2))
+                x0, y0 = self._path[i]
+                x1, y1 = self._path[i + 1]
+                target_theta = math.atan2(y1 - y0, x1 - x0)
+                cur_theta = self._orientation[0]
+                heading_err = _wrap_pi(target_theta - cur_theta)
+                steer_heading = heading_gain * heading_err
+
+            steer = steer_pid + steer_heading
+
+            # 5) steering clamp
+            steer = max(-steer_limit, min(steer_limit, steer))
+
+            # 6) 명령 적용(여기서는 큐를 쌓지 않고 "현재 tick 제어값"을 직접 적용)
+            # velocity는 dim=2라 (v_ref, 0.0) 형태로 통일
+            self._velocity = (float(v_ref), 0.0)
+            self._steering = (float(steer), 0.0)
+
+            # 7) 1 tick 적분
+            self._step(dt_ns, note="dynamic_control")
+
+            # 8) goal 체크
+            gx, gy = goal[0], goal[1]
+            if math.hypot(self._position[0] - gx, self._position[1] - gy) <= goal_tolerance:
+                self._snapshot(note="goal_reached")
+                break
+
+        return self._log

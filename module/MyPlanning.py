@@ -168,34 +168,103 @@ def point_to_path_min_distance_nd(
     return best_d, best_q, best_i, best_t
 
 class PIDVec:
+    """
+    다차원(벡터) PID 제어기.
+
+    - dim 차원의 오차 벡터 e = [e0, e1, ..., e_{dim-1}]를 입력으로 받아
+    - 각 차원별로 독립적인 PID 제어를 수행한다.
+    - 결과 u = [u0, u1, ..., u_{dim-1}] 역시 dim 차원의 제어 입력 벡터로 반환된다.
+
+    주 용도:
+    - 로봇의 조향, 속도, 위치 오차 등을 벡터 형태로 동시에 제어
+    """
+
     def __init__(self, dim: int, kp: float, ki: float, kd: float, i_limit: float = 1.0):
+        # 제어할 벡터의 차원 수
         self.dim = dim
-        self.kp, self.ki, self.kd = kp, ki, kd
+
+        # PID 게인
+        self.kp = kp  # Proportional gain (비례 항)
+        self.ki = ki  # Integral gain (적분 항)
+        self.kd = kd  # Derivative gain (미분 항)
+
+        # 적분 항 제한값 (anti-windup용)
         self.i_limit = i_limit
-        self.i = [0.0]*dim
-        self.prev_e = [0.0]*dim
+
+        # 적분 항 누적값 (차원별)
+        self.i = [0.0] * dim
+
+        # 이전 오차값 (미분 계산용)
+        self.prev_e = [0.0] * dim
+
+        # 첫 step 호출 여부 플래그
+        # 첫 호출 시에는 미분항을 계산하지 않기 위해 사용
         self.init = False
 
     def step(self, e: Sequence[float], dt: float) -> List[float]:
+        """
+        PID 제어를 한 step 수행한다.
+
+        Parameters
+        ----------
+        e : Sequence[float]
+            dim 차원의 오차 벡터.
+            예) [cross_track_error, 0.0]  (조향만 제어할 경우)
+
+        dt : float
+            제어 주기(초 단위).
+            이전 step 이후 경과 시간.
+
+        Returns
+        -------
+        u : List[float]
+            dim 차원의 제어 출력 벡터.
+        """
+
+        # 입력 오차를 float 리스트로 변환 (안전성 확보)
         e = [float(x) for x in e]
+
+        # 첫 step에서는 이전 오차가 없으므로
+        # 현재 오차를 그대로 prev_e로 초기화
         if not self.init:
             self.prev_e = e[:]
             self.init = True
 
-        # I term (anti-windup: clamp)
+        # -------------------------
+        # I (Integral) term
+        # -------------------------
+        # 적분 항 누적: i = ∫ e dt
+        # anti-windup: i_limit 범위로 클램핑
         for d in range(self.dim):
             self.i[d] += e[d] * dt
             self.i[d] = max(-self.i_limit, min(self.i_limit, self.i[d]))
 
-        # D term
-        de = [(e[d] - self.prev_e[d]) / dt if dt > 0 else 0.0 for d in range(self.dim)]
-        self.prev_e = e[:]
-
-        u = [
-            self.kp*e[d] + self.ki*self.i[d] + self.kd*de[d]
+        # -------------------------
+        # D (Derivative) term
+        # -------------------------
+        # 미분 항: de/dt
+        # dt가 0일 경우 분모 보호
+        de = [
+            (e[d] - self.prev_e[d]) / dt if dt > 0 else 0.0
             for d in range(self.dim)
         ]
+
+        # 다음 step을 위해 현재 오차를 prev_e로 저장
+        self.prev_e = e[:]
+
+        # -------------------------
+        # PID 출력 계산
+        # -------------------------
+        # u = Kp * e + Ki * ∫e dt + Kd * de/dt
+        u = [
+            self.kp * e[d] +
+            self.ki * self.i[d] +
+            self.kd * de[d]
+            for d in range(self.dim)
+        ]
+
         return u
+
 
 def compute_e_perp_nd(p, path, seg_i, q):
     """
