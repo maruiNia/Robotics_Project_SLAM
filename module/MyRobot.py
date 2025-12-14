@@ -582,13 +582,18 @@ class Moblie_robot:
             self._snapshot(note="start(dynamic-path-follow)")
 
         goal = self._path[-1]
+        
+        last_seg = 0
+        L = 5
 
         for _ in range(max_steps):
             x, y = self._position[0], self._position[1]
 
             # 1) closest point
             dmin, closest, seg_i, tparam = point_to_path_min_distance_nd([x, y], self._path)
-
+            seg_i = max(seg_i, last_seg)
+            last_seg = seg_i
+            
             # 2) signed cross-track error
             cte = self._signed_cross_track_error_2d((x, y), closest, seg_i, self._path)
 
@@ -596,16 +601,31 @@ class Moblie_robot:
             dt_s = dt_ns * 1e-9
             steer_pid = self._pid_scalar(cte, dt_s)
 
-            # 4) heading term(선택): segment 방향을 바라보게 만들어서 코너에서 덜 흔들리게
+            # 4) heading term(선택): look-ahead 목표점을 바라보게 해서 코너 튐 완화
             steer_heading = 0.0
             if use_heading_term:
-                i = max(0, min(seg_i, len(self._path) - 2))
-                x0, y0 = self._path[i]
-                x1, y1 = self._path[i + 1]
-                target_theta = math.atan2(y1 - y0, x1 - x0)
+                look_idx = min(seg_i + L, len(self._path) - 1)
+                tx, ty = self._path[look_idx]
+
+                target_theta = math.atan2(ty - y, tx - x)  # ✅ 현재 위치 -> look-ahead 점
                 cur_theta = self._orientation[0]
                 heading_err = _wrap_pi(target_theta - cur_theta)
+
                 steer_heading = heading_gain * heading_err
+
+            # dt_s 0 방어
+            dt_s = max(1e-9, dt_ns * 1e-9)
+
+            # # 4) heading term(선택): segment 방향을 바라보게 만들어서 코너에서 덜 흔들리게
+            # steer_heading = 0.0
+            # if use_heading_term:
+            #     i = max(0, min(seg_i, len(self._path) - 2))
+            #     x0, y0 = self._path[i]
+            #     x1, y1 = self._path[i + 1]
+            #     target_theta = math.atan2(y1 - y0, x1 - x0)
+            #     cur_theta = self._orientation[0]
+            #     heading_err = _wrap_pi(target_theta - cur_theta)
+            #     steer_heading = heading_gain * heading_err
 
             steer = steer_pid + steer_heading
 

@@ -21,6 +21,8 @@ def make_L_path():
         path.append([x, 0])
     for y in range(1, 6):
         path.append([5, y])
+    for x in range(5, 11):
+        path.append([x, 5])
     return path
 
 
@@ -41,7 +43,7 @@ robot = Moblie_robot(
 robot.set_path(s_path)
 
 # PID 설정(로봇 내부에서 쓰도록)
-pid = PIDVec(dim=2, kp=3, ki=0.1, kd = 1.0, i_limit=1.0)
+pid = PIDVec(dim=2, kp=6, ki=0.1, kd = 1.0, i_limit=1.0)
 robot.set_pid(pid, v_ref=1.0)
 
 model = SimpleBicycleModel(wheelbase=1.2)
