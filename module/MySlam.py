@@ -241,7 +241,7 @@ def maze_map(
 
     return m
 
-def print_map_plt(slam_map: SlamMap):
+def print_map_plt(slam_map: SlamMap, robot = None):
     """matplotlib으로 SlamMap 시각화."""
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
@@ -291,6 +291,11 @@ def print_map_plt(slam_map: SlamMap):
     if slam_map.end_point is not None:
         ex, ey = slam_map.end_point
         ax.plot(ex, ey, marker='x', color='blue', label='End')
+
+    #로봇이 주어지면 로봇 위치 그리기
+    if robot is not None:
+        rx, ry = robot.get_position()
+        ax.plot(rx, ry, marker='^', color='orange', label='Robot')
 
     plt.title('SlamMap Visualization')
     plt.xlabel('X')

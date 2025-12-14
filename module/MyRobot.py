@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union, Dict, Any
 
 from .MySensor import Circle_Sensor
+from .MyPlanning import PIDVec
+from .MyControl import MotionModel, SimpleBicycleModel
 from .MyUtils import _vec, _check_dim
 
 Number = Union[int, float]
@@ -20,6 +22,14 @@ class _Command:
     sensing: Optional[Tuple[float, ...]] = None
     time_ns: int = 0  # acc에서만 사용
 
+@dataclass
+class _ActiveAcc:
+    dv: Tuple[float, ...]          # 총 변화량(Δv)
+    ds: Tuple[float, ...]          # 총 변화량(Δsteering)
+    total_ns: int                  # 전체 지속시간
+    elapsed_ns: int                # 누적 진행시간
+    v0: Tuple[float, ...]          # 시작 velocity
+    s0: Tuple[float, ...]          # 시작 steering
 
 class Moblie_robot:
     """
@@ -49,6 +59,7 @@ class Moblie_robot:
         update_rate: int = 1000,
         sensor: Optional[Circle_Sensor] = None,
         collision_dist : float = 1e-6,
+        error_control : PIDVec = None, # 오차 제어용 PID(기본값 내부 구현)
         ):
         _check_dim(dim)
         _check_ns(update_rate, "update_rate")
@@ -61,6 +72,13 @@ class Moblie_robot:
         self._collision_dist: float = collision_dist
         self._dynamic_operation_mode : bool = dynamic_operation_mode
         self._sensing_mode : bool = sensing_mode
+        self._active_acc: Optional[_ActiveAcc] = None # 동적 모드에서 "진행중인 acc 명령"을 들고 있을 상태
+        self._last_sensing: Optional[Tuple[float, ...]] = None # 마지막 센싱(로그/디버깅용)
+        self.pid_control : PIDVec = PIDVec(dim = dim, kp = 1.0, ki = 0.0, kd = 0.1) if error_control is None else error_control
+        self._motion_model : Optional[MotionModel] = None #운동 모델
+
+        #동적 명령 처리
+        self._path = None #추적할 경로
 
         # orientation은 "방향"이니까 steering을 적분해서 얻는 값으로 하나 둠(벡터로)
         self._orientation: Tuple[float, ...] = tuple(0.0 for _ in range(dim))
@@ -94,12 +112,30 @@ class Moblie_robot:
             "orientation": self._orientation,
         }
     
+    def get_orientation(self) -> Tuple[float, ...]:
+        return self._orientation
+    
     # ----------------------
     # setters
     # ----------------------
     def set_sensor(self, sensor: Circle_Sensor) -> None:
         self._sensor = sensor
     
+    def set_path(self, path):
+        """smooth_path_nd 결과를 저장."""
+        self._path = path
+
+    def set_pid(self, pid, *, v_ref: float = 1.0, control_dt_ns: Optional[int] = None):
+        """PIDVec, 속도 목표, 제어주기 설정."""
+        self.pid_control = pid
+        self._v_ref = float(v_ref)
+        if control_dt_ns is not None:
+            self._control_dt_ns = int(control_dt_ns)
+
+    def set_motion_model(self, model: Optional[MotionModel]) -> None:
+        """조향/이동 갱신을 담당할 motion model을 설정. None이면 기존 Euler 방식."""
+        self._motion_model = model
+
     # ----------------------
     # instruction APIs
     # ----------------------
@@ -123,13 +159,9 @@ class Moblie_robot:
             sensing=None if sensing is None else _vec(self.dim, sensing, "sensing"),
         )
 
-        #동작 모드
-        if not self._dynamic_operation_mode:
-            self._queue.append(cmd)
-        else:
-            # 동적 명령 처리 모드에서는 즉시 적용
-            self._apply_set(cmd)
-
+        #큐에 등록
+        self._queue.append(cmd)
+        
     def ins_acc_mov(
         self,
         velocity: Optional[Sequence[Number]] = None,
@@ -161,19 +193,65 @@ class Moblie_robot:
             sensing=None if sensing is None else _vec(self.dim, sensing, "sensing"),
             time_ns=time,
         )
-
-        if not self._dynamic_operation_mode:
-            self._queue.append(cmd)
-        else:
-            # 동적 명령 처리 모드에서는 즉시 적용
-            self._apply_acc(cmd)
-
+        #명령 등록
+        self._queue.append(cmd)
+            
     def sensing(self) -> Any:
         """센서로 현재 위치에서 주변 환경을 센싱."""
         if not hasattr(self, '_sensor') or self._sensor is None:
             raise RuntimeError("센서가 설정되지 않았습니다.")
         
         return self._sensor.sensing(self._position)
+
+    def _begin_acc(self, cmd: _Command) -> None:
+        """acc 명령을 '진행중' 상태로 등록한다. (동적 모드에서 사용)"""
+        dv = cmd.velocity if cmd.velocity is not None else tuple(0.0 for _ in range(self.dim))
+        ds = cmd.steering if cmd.steering is not None else tuple(0.0 for _ in range(self.dim))
+
+        self._active_acc = _ActiveAcc(
+            dv=dv,
+            ds=ds,
+            total_ns=cmd.time_ns,
+            elapsed_ns=0,
+            v0=self._velocity,
+            s0=self._steering,
+        )
+
+    def _tick(self, dt_ns: int) -> None:
+        """
+        update_rate마다 한 번 호출되는 '동적 스텝' 함수.
+        - 진행중 acc가 있으면 dt_ns만큼 선형으로 v/s를 진행
+        - 없으면 hold 상태로 dt_ns만큼 진행
+        """
+        # 센싱 모드: tick 시작 시점에 한 번 갱신(원하면 acc 내부에서도 갱신 가능)
+        if self._sensing_mode:
+            sensing = self.sensing()
+            self._last_sensing = _vec(self.dim, sensing, "sensing")  # type: ignore
+
+        # 진행중 acc가 없으면 그냥 유지하며 step
+        if self._active_acc is None:
+            self._step(dt_ns, note="hold")
+            return
+
+        a = self._active_acc
+        total = a.total_ns
+
+        # 마지막 조각(예: 40ms)을 위해 남은 시간만큼만 수행
+        dt = min(dt_ns, total - a.elapsed_ns)
+
+        # 이번 tick 끝 시점의 ratio로 선형 보간
+        t_next = a.elapsed_ns + dt
+        ratio = t_next / total
+
+        self._velocity = tuple(a.v0[i] + a.dv[i] * ratio for i in range(self.dim))
+        self._steering = tuple(a.s0[i] + a.ds[i] * ratio for i in range(self.dim))
+
+        self._step(dt, note="acc_step")
+        a.elapsed_ns += dt
+
+        # acc 끝났으면 해제
+        if a.elapsed_ns >= total:
+            self._active_acc = None
 
     # ----------------------
     # simulation core
@@ -191,17 +269,95 @@ class Moblie_robot:
         )
 
     def _step(self, dt_ns: int, note: str = "") -> None:
-        """dt_ns만큼 상태 적분(단순 Euler)."""
+        """dt_ns만큼 상태 적분."""
         dt_s = dt_ns * 1e-9
 
-        # position += velocity * dt
-        self._position = tuple(self._position[i] + self._velocity[i] * dt_s for i in range(self.dim))
-
-        # orientation += steering * dt  (조향을 각속도로 가정)
-        self._orientation = tuple(self._orientation[i] + self._steering[i] * dt_s for i in range(self.dim))
+        # ✅ motion model이 있으면 그걸로 position/orientation 갱신
+        if self._motion_model is not None:
+            new_pos, new_ori = self._motion_model.step(
+                position=self._position,
+                orientation=self._orientation,
+                velocity=self._velocity,
+                steering=self._steering,
+                dt_s=dt_s,
+            )
+            self._position = new_pos
+            self._orientation = new_ori
+        else:
+            # 기존 방식(각 성분별 Euler)
+            self._position = tuple(self._position[i] + self._velocity[i] * dt_s for i in range(self.dim))
+            self._orientation = tuple(self._orientation[i] + self._steering[i] * dt_s for i in range(self.dim))
 
         self._time_ns += dt_ns
         self._snapshot(note=note)
+
+    def step_queue_with_model(self, model, dt_ns: int = None) -> bool:
+        """
+        애니메이션/실시간용: 큐에서 명령을 '조금만' 처리한다.
+        - set: 즉시 적용하고 끝
+        - acc: dt_ns만큼만 진행(남은 시간은 커맨드에 남겨둠)
+        - 이동 적분은 model(예: SimpleBicycleModel)로 수행
+        반환: 이번 호출에서 뭔가 처리했으면 True, 큐가 비었으면 False
+        """
+        if dt_ns is None:
+            dt_ns = self._update_rate_ns
+
+        # 시작 스냅샷
+        if not self._log:
+            self._snapshot(note="start(model-step)")
+
+        if not self._queue:
+            return False
+
+        self.set_motion_model(model)
+
+        cmd = self._queue[0]
+
+        if cmd.kind == "set":
+            # set은 즉시 반영 후 pop
+            self._apply_set(cmd)
+            self._queue.pop(0)
+            self._snapshot(note="set")
+            return True
+
+        if cmd.kind == "acc":
+            # acc는 dt_ns만큼만 잘라서 처리
+            remain = cmd.time_ns
+            dt = min(dt_ns, remain)
+
+            # 목표 변화량 (없으면 0)
+            dv = cmd.velocity if cmd.velocity is not None else tuple(0.0 for _ in range(self.dim))
+            ds = cmd.steering if cmd.steering is not None else tuple(0.0 for _ in range(self.dim))
+
+            # acc 시작 시점의 기준(v0,s0)을 커맨드에 저장하지 않았으니,
+            # "현재 상태를 v0/s0로 보고" 남은 시간 동안 선형 변화시키는 방식으로 단순화
+            # (애니메이션 테스트용으로는 충분히 자연스럽게 움직임)
+            v0 = self._velocity
+            s0 = self._steering
+
+            total = remain  # 남은 시간 기준으로 비율 계산
+            ratio = dt / total if total > 0 else 1.0
+
+            self._velocity = tuple(v0[i] + dv[i] * ratio for i in range(self.dim))
+            self._steering = tuple(s0[i] + ds[i] * ratio for i in range(self.dim))
+
+            # ✅ 모델로 pose 갱신
+            dt_s = dt * 1e-9
+            new_pos, new_ori = self._motion_model.step(
+                self._position, self._orientation, self._velocity, self._steering, dt_s
+            )
+            self._position = new_pos
+            self._orientation = new_ori
+            self._time_ns += dt
+            self._snapshot(note="acc(model-step)")
+
+            cmd.time_ns -= dt
+            if cmd.time_ns <= 0:
+                self._queue.pop(0)
+
+            return True
+
+        raise RuntimeError(f"알 수 없는 명령: {cmd.kind}")
 
     def _apply_set(self, cmd: _Command) -> None:
         if cmd.position is not None:
@@ -250,19 +406,11 @@ class Moblie_robot:
                 return True
         return False
 
-    
-
     def start(self) -> List[Dict[str, Any]]:
-        """
-        로봇을 작동시킨다.
-        - 큐에 쌓인 명령을 순서대로 처리
-        - 처리 과정 전체 로그를 반환
-        """
         # 시작 스냅샷
         if not self._log:
             self._snapshot(note="start")
 
-        # 테스트 코드
         if not self._dynamic_operation_mode:
             while self._queue:
                 cmd = self._queue.pop(0)
@@ -272,13 +420,77 @@ class Moblie_robot:
                     self._apply_acc(cmd)
                 else:
                     raise RuntimeError(f"알 수 없는 명령: {cmd.kind}")
-        else:
-            '''
-            동적 명령 처리 모드
-            로봇이 센싱값 주기적으로 받아서 그에 따라 움직임
-            1. 센싱값 받아오기
-            2. 센싱값에 따라 명령 생성 및 즉시 처리
-            
-            '''
+            return self._log
+
+        # -------------------------
+        # 동적 명령 처리 모드
+        # -------------------------
+        dt = self._update_rate_ns
+
+        while True:
+            # 1) 진행중 acc가 없고 큐에 명령이 있으면 하나 꺼내서 시작/적용
+            if self._active_acc is None and self._queue:
+                cmd = self._queue.pop(0)
+
+                if cmd.kind == "set":
+                    # set은 즉시 적용(그리고 같은 tick에 움직일지는 정책인데, 여기선 다음 tick에서 이동)
+                    self._apply_set(cmd)
+                elif cmd.kind == "acc":
+                    # acc는 begin만 하고 tick에서 분할 실행
+                    self._begin_acc(cmd)
+                else:
+                    raise RuntimeError(f"알 수 없는 명령: {cmd.kind}")
+
+            # 2) 한 tick 진행(진행중 acc면 acc_step, 없으면 hold)
+            self._tick(dt)
+
+            # 3) 충돌 판정 (센서 기반)
+            #    sensing_mode가 꺼져있으면 is_collision에서 sensing() 호출이 터질 수 있으니 주의.
+            if self._sensing_mode and self.is_collision():
+                self._snapshot(note="collision")
+                break
+
+            # 4) 종료 조건(임시): 더 처리할 명령도 없고 진행중 acc도 없으면 종료
+            #    (나중에 end_point 도달 판정으로 바꾸면 됨)
+            if (self._active_acc is None) and (not self._queue):
+                break
 
         return self._log
+
+    def run_queue_with_model(self, model: MotionModel) -> List[Dict[str, Any]]:
+        """
+        ✅ 요청한 기능:
+        1) 조향 처리 객체(model)를 받는다.
+        2) ins_acc_mov / ins_set_mov로 쌓인 큐를
+        3) model 변환을 통해 state를 갱신하며 실행한다.
+        """
+        self.set_motion_model(model)
+
+        # 시작 스냅샷
+        if not self._log:
+            self._snapshot(note="start(model)")
+
+        # start()가 내부적으로 _step()을 쓰므로,
+        # 여기서는 그냥 start를 호출하면 "모델 기반 step"으로 자동 실행됨.
+        return self.start()
+
+    def dynamic_operation(self) -> None:
+        """
+        동적 명령 처리 모드로 전환.
+        주어진 갱신 주기마다 _setp으로 상태를 갱신한다.
+        ins_명령어는 큐에 추가하고, 실행하지는 않는다.
+        dynamic_operation 모드에서는 start()가 호출되면 다음을 수행함:
+        - sensing_mode 가 True일 때 주기적으로 센싱값을 받아옴.
+        - 명령이 큐에 있으면 하나씩 꺼내 즉시 처리. 명령이 없으면 현 상태 유지 명령.
+            이때, 명령 지속 시간이 update_rate보다 길면 여러 스텝에 걸쳐 처리.
+            ex) time=140ms, update_rate=50ms이면 3(50, 50, 40) 스텝에 걸쳐 처리.
+            
+        - 맵 충돌 판정 수행.
+        - 맵 end_point 도달 판정 수행.
+
+        - 센싱값에 따라 실시간으로 명령을 처리함.
+        
+        """
+        self._dynamic_operation_mode = True
+        self._active_acc = None
+        
