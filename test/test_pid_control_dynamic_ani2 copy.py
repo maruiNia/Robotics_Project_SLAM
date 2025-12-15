@@ -168,4 +168,9 @@ ani = FuncAnimation(
     blit=False
 )
 
+# GIF로 저장
+output_path = "robot_animation.gif"
+ani.save(output_path, writer='pillow', fps=20)
+print(f"애니메이션이 '{output_path}'로 저장되었습니다!")
+
 plt.show()

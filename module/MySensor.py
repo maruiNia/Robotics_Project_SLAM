@@ -30,6 +30,7 @@ class Circle_Sensor(Sensor):
         distance: Number = 5,
         slam_map=None,
         step: Number = 0.05,  # 레이 전진 샘플 간격(m) - 작을수록 정밀, 느려짐
+        resolution: Number = 1,
     ):
         if dim != 2:
             raise NotImplementedError("Circle_Sensor는 현재 dim=2만 지원합니다.")
@@ -45,8 +46,13 @@ class Circle_Sensor(Sensor):
         self._dim = dim
         self._number = int(number)
         self._distance = float(distance)
-        self._step = float(step)
         self._map = slam_map
+        self._resolution = float(resolution)
+        # step을 안 주면 resolution 기반으로 자동 설정 (너무 거칠면 부정확해짐)
+        if step is None:
+            step = self._resolution / 5.0
+        self._step = float(step)
+
 
         # 노이즈 함수(없으면 None)
         # signature: f(measure: Optional[float], angle_rad: float) -> Optional[float]
@@ -106,6 +112,71 @@ class Circle_Sensor(Sensor):
             d += step
 
         return None
+
+def localize_grid_by_circle_scan(
+    slam_map,
+    sensor,             # Circle_Sensor 인스턴스
+    z_meas,             # sensor.sensing(real_pose)로 얻은 리스트(거리들)
+    *,
+    resolution: float = 1.0,
+    sigma: float = 0.4, # 센서 노이즈(거리) 표준편차
+):
+    if slam_map.limit is None:
+        raise ValueError("slam_map.limit가 필요해요 (maze_map 쓰면 있음).")
+
+    (x0, y0), (x1, y1) = slam_map.limit
+    nx = int(math.ceil((x1 - x0) / resolution))
+    ny = int(math.ceil((y1 - y0) / resolution))
+
+    # log-likelihood로 누적(언더플로 방지)
+    logw = [[-1e18]*nx for _ in range(ny)]
+    best_ll = -1e18
+    best_xy = (x0, y0)
+
+    for iy in range(ny):
+        cy = y0 + (iy + 0.5) * resolution
+        for ix in range(nx):
+            cx = x0 + (ix + 0.5) * resolution
+
+            if slam_map.is_wall((cx, cy), inclusive=True):
+                continue
+
+            z_pred = sensor.sensing((cx, cy))
+
+            ll = 0.0
+            for m, p in zip(z_meas, z_pred):
+                # None은 "범위 내 장애물 없음"이라서, 비교 시 max_range 취급이 깔끔
+                m2 = sensor.get_distance() if m is None else m
+                p2 = sensor.get_distance() if p is None else p
+                err = m2 - p2
+                ll += -0.5 * (err / sigma) ** 2
+
+            logw[iy][ix] = ll
+            if ll > best_ll:
+                best_ll = ll
+                best_xy = (cx, cy)
+
+    # 정규화(softmax)
+    max_ll = max(max(row) for row in logw)
+    prob = []
+    s = 0.0
+    for row in logw:
+        prow = []
+        for v in row:
+            if v < -1e17:
+                p = 0.0
+            else:
+                p = math.exp(v - max_ll)
+            prow.append(p)
+            s += p
+        prob.append(prow)
+
+    if s > 0:
+        for iy in range(ny):
+            for ix in range(nx):
+                prob[iy][ix] /= s
+
+    return best_xy, prob, (x0, y0, nx, ny, resolution)
 
 
 # ---------------------------
