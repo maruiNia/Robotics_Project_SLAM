@@ -171,3 +171,30 @@ land_3 = (7, 2)
         # #맵 테스트 모드 - False = 센서 ON(맵 모름, 내 위치 모름), True = 센서 OFF(맵 알고 내 위치도 앎)
         # self._test_map_mode : bool = False
         # self._test_SlamMap = None #테스트용 맵 객체
+
+        # ----------------------
+        # 3) 추정 상태(est state): predict는 매 tick, update는 주기적으로
+        # ----------------------
+        if self._sensing_mode and self._loc_enabled:
+            # (1) Predict: dead-reckoning
+            if self._motion_model is not None:
+                est_pos, est_ori = self._motion_model.step(
+                    position=self._pos_est,
+                    orientation=self._ori_est,
+                    velocity=self._velocity,
+                    steering=self._steering,
+                    dt_s=dt_s,
+                )
+                self._pos_est = est_pos
+                self._ori_est = est_ori
+            else:
+                self._pos_est = tuple(self._pos_est[i] + self._velocity[i] * dt_s for i in range(self.dim))
+                self._ori_est = tuple(self._ori_est[i] + self._steering[i] * dt_s for i in range(self.dim))
+
+            # (2) Update: N tick마다만 센서로 보정
+            if (not self._loc_predict_only) and self._loc_use_sensor_update and (self._tick_count % self._loc_period == 0):
+                if self._last_sensing is not None and self._sensor is not None:
+                    self._pos_est = self._localize_grid_by_circle_scan(self._last_sensing)
+
+                    # 센싱 후 추정 시 스냅샷 출력
+                    print(f"[Tick {self._tick_count}] t={self._time_ns}ns, pos={self._position}, est_pos={self._pos_est}, vel={self._velocity}, steer={self._steering}")

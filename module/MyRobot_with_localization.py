@@ -9,6 +9,7 @@ from .MyControl import MotionModel, SimpleBicycleModel
 from .MyUtils import _vec, _check_dim, _wrap_pi
 from .MySlam import SlamMap
 from .MyNavi import astar_find_path_center_nodes, euclidean
+from .MyGraphSlam import PoseGraphSLAM2D
 
 from collections import deque
 import math
@@ -129,8 +130,31 @@ class Moblie_robot:
         self._prev_replan_path = None        # 이전 tick에서 사용한 path
         self._prev_replan_seg = 0            # 이전 tick의 진행 seg index(뒤로 점프 방지)
 
+        #Graph-SLAM 관련
+        self._pgslam_enabled = False
+        self._pgslam = PoseGraphSLAM2D(prior_info=1e6)
+        self._pgslam_k = -1  # current pose node index
+        self._pgslam_last_est = None  # last optimized pose (x,y)
+
         # 동적 명령 처리
         self._path = None #추적할 경로
+
+        # ======================
+        # EKF related
+        # ======================
+        self._ekf_enabled = False
+        # state: [x, y, theta]
+        self._ekf_x = np.zeros(3)
+        # covariance
+        self._ekf_P = np.eye(3) * 0.05
+        # process noise 로봇의 움직임이 얼마나 틀릴 수 있는가 크면 클수록 날뜀
+        self._ekf_Q = np.diag([0.01, 0.01, 0.01])
+        # measurement noise (grid localization)
+        self._ekf_R = np.diag([0.2, 0.2])  # grid는 크면 클수록 좀 시끄러움 
+
+        self._ekf_x[0:2] = self._pos_est
+        self._ekf_x[2] = self._ori_est[0]
+
 
         # orientation은 "방향"이니까 steering을 적분해서 얻는 값으로 하나 둠(벡터로)
         self._orientation: Tuple[float, ...] = tuple(0.0 for _ in range(dim))
@@ -159,6 +183,12 @@ class Moblie_robot:
         """
         self._loc_use_sensor_update = bool(enable)
 
+    def enable_ekf(self, flag: bool = True):
+        self._ekf_enabled = flag
+
+    def enable_pgslam(self, flag: bool = True):
+        self._pgslam_enabled = flag
+        
     # ----------------------
     # getters
     # ----------------------
@@ -249,6 +279,7 @@ class Moblie_robot:
         """
         self._fake_fast_sensing = bool(enable)
         self._fake_fast_sensing_sigma = float(sigma)
+    
     # ----------------------
     # instruction APIs
     # ----------------------
@@ -388,29 +419,45 @@ class Moblie_robot:
         # 3) 추정 상태(est state): predict는 매 tick, update는 주기적으로
         # ----------------------
         if self._sensing_mode and self._loc_enabled:
-            # (1) Predict: dead-reckoning
-            if self._motion_model is not None:
-                est_pos, est_ori = self._motion_model.step(
-                    position=self._pos_est,
-                    orientation=self._ori_est,
-                    velocity=self._velocity,
-                    steering=self._steering,
-                    dt_s=dt_s,
-                )
-                self._pos_est = est_pos
-                self._ori_est = est_ori
+
+            if self._ekf_enabled:
+                # ✅ EKF 경로: predict는 매 tick
+                self._ekf_predict(dt_s)
+
+                # ✅ update는 주기적으로만
+                if (not self._loc_predict_only) and self._loc_use_sensor_update and (self._tick_count % self._loc_period == 0):
+                    if self._last_sensing is not None and self._sensor is not None:
+                        # grid localization은 'measurement z' 생성용으로 딱 1번만
+                        z_xy = self._localize_grid_by_circle_scan(self._last_sensing)
+                        self._ekf_update_xy(z_xy)
+
+                        print(f"[Tick {self._tick_count}] EKF update "
+                            f"true={self._position}, est={self._pos_est}, z={z_xy} ")
+
             else:
-                self._pos_est = tuple(self._pos_est[i] + self._velocity[i] * dt_s for i in range(self.dim))
-                self._ori_est = tuple(self._ori_est[i] + self._steering[i] * dt_s for i in range(self.dim))
+                # ✅ 기존 경로: dead-reckoning
+                if self._motion_model is not None:
+                    est_pos, est_ori = self._motion_model.step(
+                        position=self._pos_est,
+                        orientation=self._ori_est,
+                        velocity=self._velocity,
+                        steering=self._steering,
+                        dt_s=dt_s,
+                    )
+                    self._pos_est = est_pos
+                    self._ori_est = est_ori
+                else:
+                    self._pos_est = tuple(self._pos_est[i] + self._velocity[i] * dt_s for i in range(self.dim))
+                    self._ori_est = tuple(self._ori_est[i] + self._steering[i] * dt_s for i in range(self.dim))
 
-            # (2) Update: N tick마다만 센서로 보정
-            if (not self._loc_predict_only) and self._loc_use_sensor_update and (self._tick_count % self._loc_period == 0):
-                if self._last_sensing is not None and self._sensor is not None:
-                    self._pos_est = self._localize_grid_by_circle_scan(self._last_sensing)
+                # ✅ 주기적 보정(덮어쓰기)
+                if (not self._loc_predict_only) and self._loc_use_sensor_update and (self._tick_count % self._loc_period == 0):
+                    if self._last_sensing is not None and self._sensor is not None:
+                        self._pos_est = self._localize_grid_by_circle_scan(self._last_sensing)
 
-                    # 센싱 후 추정 시 스냅샷 출력
-                    print(f"[Tick {self._tick_count}] t={self._time_ns}ns, pos={self._position}, est_pos={self._pos_est}, vel={self._velocity}, steer={self._steering}")
-
+                        print(f"[Tick {self._tick_count}] t={self._time_ns}ns, "
+                            f"pos={self._position}, est_pos={self._pos_est}, vel={self._velocity}, steer={self._steering}")
+                        
         # 5) 충돌 판정
         # ----------------------
         if self._sensor is not None and self._last_sensing is not None:
@@ -1345,7 +1392,6 @@ class Moblie_robot:
         self.set_motion_model(model)
         self._tick(dt_ns, note="replan_step(dynamic_control)")
 
-
     def _snap_to_grid_center(self, pos, resolution: float, center_offset: float = 0.5):
         """
         연속 좌표 pos를, A*가 기대하는 'resolution 격자'의 셀 중심좌표로 스냅.
@@ -1470,3 +1516,72 @@ class Moblie_robot:
             else:
                 out.append(float(v) + random.gauss(0.0, self._meas_noise_sigma))
         return out
+
+    #----------------------
+    # 칼만 필터
+    #----------------------
+    def _ekf_predict(self, dt_s: float):
+        """
+        EKF prediction using unicycle-like model
+        EKF Predict 단계 (motion model)
+        """
+        x, y, th = self._ekf_x
+        v = self._velocity[0]
+        w = self._steering[0]
+
+        # --- state prediction ---
+        x_pred = np.array([
+            x + v * np.cos(th) * dt_s,
+            y + v * np.sin(th) * dt_s,
+            th + w * dt_s
+        ])
+
+        # --- Jacobian F ---
+        F = np.array([
+            [1, 0, -v * np.sin(th) * dt_s],
+            [0, 1,  v * np.cos(th) * dt_s],
+            [0, 0, 1]
+        ])
+
+        # --- covariance prediction ---
+        self._ekf_x = x_pred
+        self._ekf_P = F @ self._ekf_P @ F.T + self._ekf_Q
+
+        self._ekf_sync_to_est()
+
+    def _ekf_update_xy(self, z_xy):
+        """
+        EKF update with position measurement (x, y)
+        grid localization 결과는 (x, y) 만 있음 👇
+        이게 EKF에선 측정 벡터 z
+        """
+        z = np.array(z_xy)
+
+        # measurement model: h(x) = [x, y]
+        H = np.array([
+            [1, 0, 0],
+            [0, 1, 0]
+        ])
+
+        x = self._ekf_x
+        P = self._ekf_P
+
+        # innovation
+        y = z - H @ x
+
+        S = H @ P @ H.T + self._ekf_R
+        K = P @ H.T @ np.linalg.inv(S)
+
+        # update
+        self._ekf_x = x + K @ y
+        self._ekf_P = (np.eye(3) - K @ H) @ P
+
+        self._ekf_sync_to_est()
+
+    def _ekf_sync_to_est(self):
+        '''
+        EKF → 로봇 추정 상태 동기화
+        '''
+        self._pos_est = tuple(self._ekf_x[0:2])
+        self._ori_est = (self._ekf_x[2],)
+

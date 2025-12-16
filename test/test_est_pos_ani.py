@@ -27,15 +27,41 @@ def main():
     # 1) 맵/센서/로봇 세팅
     # -------------------------
     print("맵/센서/로봇 세팅 중...")
-    maze = [
-        [0, 1, 1, 1, 1, 1],
-        [0, 1, 0, 0, 0, 1],
-        [0, 0, 0, 1, 0, 1],
-    ]
-    cell_size = 5
-    m = maze_map(maze, (0, 0), (4, 2), cell_size=cell_size)
+    # maze = [
+    #     [0, 1, 1, 1, 1, 1],
+    #     [0, 1, 0, 0, 0, 1],
+    #     [0, 0, 0, 1, 0, 1],
+    # ]
+    # cell_size = 3
+    # m = maze_map(maze, (0, 0), (4, 2), cell_size=cell_size)
+    # vel = 1.0
 
-    sensor = Circle_Sensor(dim=2, number=20, distance=12.0, slam_map=m, step=0.1)
+    #과제 맵
+    maze = [ ## 0 1  2 3  4  5 6  7  8 9 10 11 12 
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # 9
+        [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0], # 8
+        [0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 0], # 7
+        [0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0], # 6
+        [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0], # 5
+        [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # 4
+        [0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1], # 3
+        [0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], # 2
+        [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], # 1
+        [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], # 0
+    ]
+    start = (0, 9)
+    end_g1 = (11, 9)
+    end_g2 = (11, 1)
+
+    land_1 = (2, 6)
+    land_2 = (3, 4)
+    land_3 = (7, 2)
+
+    cell_size = 3
+    m = maze_map(maze, start, end_g1, cell_size=cell_size)
+    vel = 2
+
+    sensor = Circle_Sensor(dim=2, number=10, distance=12.0, slam_map=m, step=0.1)
 
     robot = Moblie_robot(
         dim=2,
@@ -47,13 +73,15 @@ def main():
     )
 
     robot.enable_estimated_pose(True)
-    robot.set_localization_params(resolution=0.2, sigma=0.5, period=5)
-    pid = PIDVec(dim=2, kp=1.0, ki=0.5, kd=0.5)
-    robot.set_pid(pid, v_ref=1.5)
+    robot.set_localization_params(resolution=0.2, sigma=0.5, period=1)
+    pid = PIDVec(dim=2, kp=1.5, ki=0.1, kd=0.3)
+    robot.set_pid(pid, v_ref=vel)
 
-    robot.set_fake_fast_sensing(True, sigma=0.05)
+    robot.set_fake_fast_sensing(True, sigma=0.5)
+    robot.enable_ekf(True)
+    # robot.enable_ekf(False)
 
-    model = SimpleBicycleModel(wheelbase=1.0)
+    model = SimpleBicycleModel(wheelbase=1.2)
 
     # -------------------------
     # 2) 로봇이 모든 연산을 끝낸 뒤 log 확보 (애니는 log만 사용)
@@ -65,14 +93,14 @@ def main():
         smooth=True,
         smooth_alpha=0.6,
         smooth_beta=0.3,
-        v_ref=1.5,
+        v_ref=vel,
         dt_ns=50_000_000,
         goal_tolerance=0.5,
-        max_steps=50000,
-        steer_limit=1.7,
+        max_steps=5000,
+        steer_limit=1.2,
         use_heading_term=True,
         heading_gain=0.6,
-        look_ahead=10,
+        look_ahead= 6,
     )
 
     if not log:
