@@ -1,0 +1,31 @@
+0 0 0 0 0 
+
+[ ## 0 1  2 3  4  5 6  7  8 9 10 11 12 
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # 9
+    [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0], # 8
+    [0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 0], # 7
+    [0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0], # 6
+    [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0], # 5
+    [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # 4
+    [0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1], # 3
+    [0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], # 2
+    [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], # 1
+    [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], # 0
+]
+start = (0, 9)
+end_g1 = (11, 9)
+end_g2 = (11, 1)
+
+land_1 = (2, 6)
+land_2 = (3, 4)
+land_3 = (7, 2)
+
+# self._pos_est: Tuple[float, ...] = self._position
+        # self._ori_est: Tuple[float, ...] = tuple(0.0 for _ in range(dim))  # ✅ (추가) 추정 heading/방향
+
+        # self._use_estimated_pose: bool = True # get_position/get_orientation에서 est를 쓸지
+
+        # self._loc_resolution: float = 1.0
+        # self._loc_sigma: float = 0.5
+        # self._loc_period: int = 5
+        # self._tick_count: int = 0
