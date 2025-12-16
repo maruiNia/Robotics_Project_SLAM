@@ -132,19 +132,6 @@ class Moblie_robot:
         # 동적 명령 처리
         self._path = None #추적할 경로
 
-
-        # --- EKF on/off ---
-        self._ekf_enabled = True
-        # 상태 x = [x, y, theta]
-        self._ekf_x = np.array([self._pos_est[0], self._pos_est[1], self._ori_est[0]], dtype=float)
-        # 공분산 P
-        self._ekf_P = np.diag([0.5**2, 0.5**2, (5.0 * math.pi/180.0)**2])  # 초기 불확실성(예시)
-        # 프로세스 노이즈 Q (모델 예측이 얼마나 틀릴 수 있나)
-        self._ekf_Q = np.diag([0.02**2, 0.02**2, (1.0 * math.pi/180.0)**2])
-        # 측정 노이즈 R (그리드매칭 측정이 얼마나 시끄럽나)
-        self._ekf_R = np.diag([0.50**2, 0.50**2])  # (x,y)만 측정한다고 가정
-
-
         # orientation은 "방향"이니까 steering을 적분해서 얻는 값으로 하나 둠(벡터로)
         self._orientation: Tuple[float, ...] = tuple(0.0 for _ in range(dim))
 
@@ -172,10 +159,6 @@ class Moblie_robot:
         """
         self._loc_use_sensor_update = bool(enable)
 
-    def enable_ekf(self, enable: bool = True) -> None:
-        """EKF 사용 on/off"""
-        self._ekf_enabled = bool(enable)
-        
     # ----------------------
     # getters
     # ----------------------
@@ -1487,63 +1470,3 @@ class Moblie_robot:
             else:
                 out.append(float(v) + random.gauss(0.0, self._meas_noise_sigma))
         return out
-
-    #----------------------
-    # 칼만 필터
-    #----------------------
-    def _ekf_sync_to_est(self) -> None:
-        """EKF 상태 -> (pos_est, ori_est)로 반영"""
-        x, y, th = float(self._ekf_x[0]), float(self._ekf_x[1]), float(self._ekf_x[2])
-        self._pos_est = (x, y)
-        # orientation이 (theta, 0.0) 같은 형태라면 첫 축만 갱신
-        self._ori_est = (th,) + tuple(0.0 for _ in range(self.dim - 1))
-
-    def _ekf_predict(self, dt_s: float) -> None:
-        """제어(velocity/steering)로 예측 단계"""
-        if not self._ekf_enabled:
-            return
-
-        x, y, th = self._ekf_x
-        v = float(self._velocity[0]) if len(self._velocity) > 0 else 0.0
-        w = float(self._steering[0]) if len(self._steering) > 0 else 0.0
-
-        # 비선형 상태전이
-        nx = x + v * math.cos(th) * dt_s
-        ny = y + v * math.sin(th) * dt_s
-        nth = th + w * dt_s
-        self._ekf_x = np.array([nx, ny, nth], dtype=float)
-
-        # Jacobian F = df/dx
-        F = np.array([
-            [1.0, 0.0, -v * math.sin(th) * dt_s],
-            [0.0, 1.0,  v * math.cos(th) * dt_s],
-            [0.0, 0.0,  1.0],
-        ], dtype=float)
-
-        self._ekf_P = F @ self._ekf_P @ F.T + self._ekf_Q
-        self._ekf_sync_to_est()
-
-    def _ekf_update_xy(self, z_xy: Tuple[float, float]) -> None:
-        """측정 z=(x,y)로 update 단계"""
-        if not self._ekf_enabled:
-            return
-
-        z = np.array([float(z_xy[0]), float(z_xy[1])], dtype=float)
-
-        H = np.array([
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ], dtype=float)
-
-        x = self._ekf_x
-        P = self._ekf_P
-
-        y = z - (H @ x)                        # innovation
-        S = H @ P @ H.T + self._ekf_R          # innovation cov
-        K = P @ H.T @ np.linalg.inv(S)         # Kalman gain
-
-        self._ekf_x = x + K @ y
-        I = np.eye(3, dtype=float)
-        self._ekf_P = (I - K @ H) @ P
-
-        self._ekf_sync_to_est()
