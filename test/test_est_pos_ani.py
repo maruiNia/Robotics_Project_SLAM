@@ -26,6 +26,7 @@ def main():
     # -------------------------
     # 1) 맵/센서/로봇 세팅
     # -------------------------
+    print("맵/센서/로봇 세팅 중...")
     maze = [
         [0, 1, 1, 1, 1, 1],
         [0, 1, 0, 0, 0, 1],
@@ -34,7 +35,7 @@ def main():
     cell_size = 5
     m = maze_map(maze, (0, 0), (4, 2), cell_size=cell_size)
 
-    sensor = Circle_Sensor(dim=2, number=48, distance=12.0, slam_map=m, step=0.05)
+    sensor = Circle_Sensor(dim=2, number=20, distance=12.0, slam_map=m, step=0.1)
 
     robot = Moblie_robot(
         dim=2,
@@ -44,27 +45,30 @@ def main():
         sensing_mode=True,
         sensor=sensor,
     )
-    robot.set_test_map_mode(True, m)  # 테스트 모드(맵 알고 있음)
-    robot.enable_estimated_pose(True)
 
-    pid = PIDVec(dim=2, kp=1.5, ki=0.5, kd=0.5)
-    robot.set_pid(pid, v_ref=2.0)
+    robot.enable_estimated_pose(True)
+    robot.set_localization_params(resolution=0.2, sigma=0.5, period=5)
+    pid = PIDVec(dim=2, kp=1.0, ki=0.5, kd=0.5)
+    robot.set_pid(pid, v_ref=1.5)
+
+    robot.set_fake_fast_sensing(True, sigma=0.05)
 
     model = SimpleBicycleModel(wheelbase=1.0)
 
     # -------------------------
     # 2) 로봇이 모든 연산을 끝낸 뒤 log 확보 (애니는 log만 사용)
     # -------------------------
+    print("로봇 실행 및 로그 확보 중...")
     log = robot.run_replanning_astar_follow(
         model,
         expansion=1,
         smooth=True,
         smooth_alpha=0.6,
         smooth_beta=0.3,
-        v_ref=2.0,
+        v_ref=1.5,
         dt_ns=50_000_000,
         goal_tolerance=0.5,
-        max_steps=5000,
+        max_steps=50000,
         steer_limit=1.7,
         use_heading_term=True,
         heading_gain=0.6,

@@ -71,6 +71,9 @@ class Circle_Sensor(Sensor):
     def get_distance(self) -> float:
         return self._distance
 
+    def get_map(self):
+        return self._map
+    
     def sensing(self, position: Sequence[Number]) -> List[Optional[float]]:
         """
         position: (x, y)

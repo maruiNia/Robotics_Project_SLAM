@@ -29,3 +29,145 @@ land_3 = (7, 2)
         # self._loc_sigma: float = 0.5
         # self._loc_period: int = 5
         # self._tick_count: int = 0
+
+            # 안쓴다!
+    # def set_test_map_mode(self, mode: bool, test_map: Optional[SlamMap] = None) -> None:
+    #     """맵 테스트 모드 설정."""
+    #     self._test_map_mode = mode
+    #     self._test_SlamMap = test_map
+
+
+        #더 이상 사용 안함 아까워서 남겨둠
+    def _update_estimated_pose(self) -> None:
+        """(true position에서) 센서 측정 -> 맵 매칭으로 추정 위치 갱신"""
+        # print("Updating estimated pose...")
+        if not self._sensing_mode or self._sensor is None:
+            self._pos_est = self._position
+            return
+        if getattr(self, "_test_map_mode", False):
+            self._pos_est = self._position
+            return
+        z = self._sensor.sensing(self._position)
+        self._last_sensing = z
+        self._pos_est = self._localize_grid_by_circle_scan(z)
+        print("real position:", self._position, "sensing:", z, "estimated position:", self._pos_est)
+
+
+    def _step(self, dt_ns: int, note: str = "") -> None:
+        """dt_ns만큼 상태 적분."""
+        dt_s = dt_ns * 1e-9
+        
+        print(f"tick {self._tick_count}: dt_ns={dt_ns}, dt_s={dt_s}")
+        # ✅ motion model이 있으면 그걸로 position/orientation 갱신
+        if self._motion_model is not None:
+            new_pos, new_ori = self._motion_model.step(
+                position=self._position,
+                orientation=self._orientation,
+                velocity=self._velocity,
+                steering=self._steering,
+                dt_s=dt_s,
+            )
+            self._position = new_pos
+            self._orientation = new_ori
+        else:
+            # 기존 방식(각 성분별 Euler)
+            self._position = tuple(self._position[i] + self._velocity[i] * dt_s for i in range(self.dim))
+            self._orientation = tuple(self._orientation[i] + self._steering[i] * dt_s for i in range(self.dim))
+
+        self._time_ns += dt_ns
+
+        # ✅ (localization) predict-update 구조
+        # 1) predict: 매 tick마다 제어(velocity/steering)로 추정 상태 적분
+        # 2) update : N틱마다만 센서 측정으로 보정(그리드 매칭)
+        if self._sensing_mode and self._loc_enabled:
+            # (테스트 모드면 "정답"을 안다고 가정 -> 추정치도 true로 맞춰둠)
+            if getattr(self, "_test_map_mode", False):
+                self._pos_est = self._position
+                self._ori_est = self._orientation
+            else:
+                # --- 1) Predict (dead-reckoning) ---
+                if self._motion_model is not None:
+                    # motion model이 있으면 동일 모델로 "추정 상태"도 예측
+                    est_pos, est_ori = self._motion_model.step(
+                        position=self._pos_est,
+                        orientation=self._ori_est,
+                        velocity=self._velocity,
+                        steering=self._steering,
+                        dt_s=dt_s,
+                    )
+                    self._pos_est = est_pos
+                    self._ori_est = est_ori
+                else:
+                    # Euler 적분(간단 버전)
+                    self._pos_est = tuple(self._pos_est[i] + self._velocity[i] * dt_s for i in range(self.dim))
+                    self._ori_est = tuple(self._ori_est[i] + self._steering[i] * dt_s for i in range(self.dim))
+
+                # --- 2) Update (measurement correction) ---
+                # 센서 update가 켜져 있고, 이번 tick이 period에 해당하면 그리드 매칭으로 보정
+                if (not self._loc_predict_only) and self._loc_use_sensor_update and (self._tick_count % self._loc_period == 0):
+                    if self._last_sensing is not None:
+                        self._pos_est = self._localize_grid_by_circle_scan(self._last_sensing)
+#debug
+                        print(f"real pos: {self._position}, est pos(before update): {self._pos_est}")
+                        # NOTE: 지금은 (x,y)만 보정. orientation은 predict로만 유지.
+                        # 나중에 EKF/Particle에서는 measurement update로 orientation도 함께 업데이트 가능.
+
+        self._snapshot(note=note)
+
+    def _tick(self, dt_ns: int) -> None:
+        """
+        update_rate마다 한 번 호출되는 '동적 스텝' 함수.
+        - 진행중 acc가 있으면 dt_ns만큼 선형으로 v/s를 진행
+        - 없으면 hold 상태로 dt_ns만큼 진행
+        """
+        print("_tick called with dt_ns =", dt_ns)
+        self._tick_count += 1
+        # 센싱 모드: tick 시작 시점에 한 번 갱신(원하면 acc 내부에서도 갱신 가능)
+
+        # ✅ 센싱은 "매 tick마다" 수행
+        # - 센서 값은 매번 갱신해서 _last_sensing에 보관(로그/충돌판정/업데이트에 재사용)
+        # - 다만 "위치추정(update)"는 _step()에서 loc_period에 맞춰 가끔만 수행한다.
+        if self._sensing_mode and (self._sensor is not None):
+            sensing = self._sensor.sensing(self._position)          # true position에서 센서 측정
+            sensing = self._apply_measurement_noise(sensing)         # (옵션) 가우시안 노이즈
+            self._last_sensing = _vec(self.dim, sensing, "sensing")  # type: ignore
+
+
+        # 진행중 acc가 없으면 그냥 유지하며 step
+        if self._active_acc is None:
+            self._step(dt_ns, note="hold")
+            return
+
+        a = self._active_acc
+        total = a.total_ns
+
+        # 마지막 조각(예: 40ms)을 위해 남은 시간만큼만 수행
+        dt = min(dt_ns, total - a.elapsed_ns)
+
+        # 이번 tick 끝 시점의 ratio로 선형 보간
+        t_next = a.elapsed_ns + dt
+        ratio = t_next / total
+
+        self._velocity = tuple(a.v0[i] + a.dv[i] * ratio for i in range(self.dim))
+        self._steering = tuple(a.s0[i] + a.ds[i] * ratio for i in range(self.dim))
+
+        self._step(dt, note="acc_step")
+        a.elapsed_ns += dt
+
+        # acc 끝났으면 해제
+        if a.elapsed_ns >= total:
+            self._active_acc = None
+
+        # 테스트 맵 모드 확인
+        if not self._test_map_mode or self._test_SlamMap is None:
+            raise RuntimeError(
+                "테스트 맵 모드가 아니거나, 테스트 SlamMap이 설정되지 않았습니다. "
+                "set_test_map_mode(True, map)를 먼저 호출하세요."
+            )
+
+        slam_map = self._test_SlamMap
+
+        #안쓴다!
+        # #맵 테스트 모드 - False = 센서 ON(맵 모름, 내 위치 모름), True = 센서 OFF(맵 알고 내 위치도 앎)
+        # self._test_map_mode : bool = False
+        # self._test_SlamMap = None #테스트용 맵 객체

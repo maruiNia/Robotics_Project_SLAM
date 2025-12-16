@@ -14,6 +14,8 @@ from collections import deque
 import math
 import random  # ✅ (추가) 센서 측정에 가우시안 노이즈 넣을 때 사용
 
+import numpy as np  # 파일 상단에 없으면 추가
+
 
 Number = Union[int, float]
 
@@ -94,6 +96,9 @@ class Moblie_robot:
         self._loc_use_sensor_update: bool = True  # ✅ N틱마다 센싱+보정(update) 할지
         self._loc_predict_only: bool = False   # ✅ True면 update 없이 predict만 (디버깅용)
 
+        self._fake_fast_sensing: bool = None  # ✅ True면 현 위치에서 가우시안 분포 노이즈 추가 
+        self._fake_fast_sensing_sigma: float = 0.5  # ✅ 가우시안 노이즈 표준편차
+
         # (Grid matching params)
         self._loc_resolution: float = 1.0
         self._loc_sigma: float = 0.5
@@ -102,6 +107,9 @@ class Moblie_robot:
         # (Measurement noise; 나중에 칼만/파티클로 갈 때 그대로 확장 가능)
         self._meas_noise_enabled: bool = False
         self._meas_noise_sigma: float = 0.0    # 가우시안 표준편차(거리 단위)
+
+        #충돌 감지
+        self._collision_detected: bool = False
 
         self._tick_count: int = 0
 
@@ -121,12 +129,21 @@ class Moblie_robot:
         self._prev_replan_path = None        # 이전 tick에서 사용한 path
         self._prev_replan_seg = 0            # 이전 tick의 진행 seg index(뒤로 점프 방지)
 
-        #맵 테스트 모드 - False = 센서 ON(맵 모름, 내 위치 모름), True = 센서 OFF(맵 알고 내 위치도 앎)
-        self._test_map_mode : bool = False
-        self._test_SlamMap = None #테스트용 맵 객체
-
-        #동적 명령 처리
+        # 동적 명령 처리
         self._path = None #추적할 경로
+
+
+        # --- EKF on/off ---
+        self._ekf_enabled = True
+        # 상태 x = [x, y, theta]
+        self._ekf_x = np.array([self._pos_est[0], self._pos_est[1], self._ori_est[0]], dtype=float)
+        # 공분산 P
+        self._ekf_P = np.diag([0.5**2, 0.5**2, (5.0 * math.pi/180.0)**2])  # 초기 불확실성(예시)
+        # 프로세스 노이즈 Q (모델 예측이 얼마나 틀릴 수 있나)
+        self._ekf_Q = np.diag([0.02**2, 0.02**2, (1.0 * math.pi/180.0)**2])
+        # 측정 노이즈 R (그리드매칭 측정이 얼마나 시끄럽나)
+        self._ekf_R = np.diag([0.50**2, 0.50**2])  # (x,y)만 측정한다고 가정
+
 
         # orientation은 "방향"이니까 steering을 적분해서 얻는 값으로 하나 둠(벡터로)
         self._orientation: Tuple[float, ...] = tuple(0.0 for _ in range(dim))
@@ -155,6 +172,10 @@ class Moblie_robot:
         """
         self._loc_use_sensor_update = bool(enable)
 
+    def enable_ekf(self, enable: bool = True) -> None:
+        """EKF 사용 on/off"""
+        self._ekf_enabled = bool(enable)
+        
     # ----------------------
     # getters
     # ----------------------
@@ -226,11 +247,6 @@ class Moblie_robot:
         """조향/이동 갱신을 담당할 motion model을 설정. None이면 기존 Euler 방식."""
         self._motion_model = model
 
-    def set_test_map_mode(self, mode: bool, test_map: Optional[SlamMap] = None) -> None:
-        """맵 테스트 모드 설정."""
-        self._test_map_mode = mode
-        self._test_SlamMap = test_map
-
     def set_localization_params(self, *, resolution: float = 1.0, sigma: float = 0.5, period: int = 5) -> None:
         """그리드 기반 로컬라이제이션 파라미터."""
         if resolution <= 0:
@@ -243,6 +259,13 @@ class Moblie_robot:
         self._loc_sigma = float(sigma)
         self._loc_period = int(period)
 
+    def set_fake_fast_sensing(self, enable: bool = True, sigma: float = 0.5) -> None:
+        """✅ 페이크 빠른 센싱 모드 설정.
+        - enable=True면, 센서 없이 현 위치에 가우시안 노이즈 추가한 값으로 센싱 흉내냄
+        - sigma: 가우시안 표준편차(거리 단위)
+        """
+        self._fake_fast_sensing = bool(enable)
+        self._fake_fast_sensing_sigma = float(sigma)
     # ----------------------
     # instruction APIs
     # ----------------------
@@ -324,49 +347,103 @@ class Moblie_robot:
             s0=self._steering,
         )
 
-    def _tick(self, dt_ns: int) -> None:
+    def _tick(self, dt_ns: int, *, note: str = "tick") -> None:
         """
-        update_rate마다 한 번 호출되는 '동적 스텝' 함수.
-        - 진행중 acc가 있으면 dt_ns만큼 선형으로 v/s를 진행
-        - 없으면 hold 상태로 dt_ns만큼 진행
+        ✅ tick 기반 '전체 프레임' 함수.
+        한 번 호출 = 한 tick.
+        순서:
+        1) tick_count 증가
+        2) (필요시) acc 진행으로 v/steer 갱신
+        3) 실제 상태 적분(_step)
+        4) 센싱(매 tick)
+        5) 추정(predict 매 tick) + 보정(update는 주기적으로)
+        6) snapshot 기록
         """
-        print("_tick called with dt_ns =", dt_ns)
         self._tick_count += 1
-        # 센싱 모드: tick 시작 시점에 한 번 갱신(원하면 acc 내부에서도 갱신 가능)
+        dt_s = dt_ns * 1e-9
 
-        # ✅ 센싱은 "매 tick마다" 수행
-        # - 센서 값은 매번 갱신해서 _last_sensing에 보관(로그/충돌판정/업데이트에 재사용)
-        # - 다만 "위치추정(update)"는 _step()에서 loc_period에 맞춰 가끔만 수행한다.
+        # ----------------------
+        # 0) acc 진행 처리 (동적 모드에서만 의미)
+        # ----------------------
+        if self._active_acc is not None:
+            a = self._active_acc
+            total = a.total_ns
+            dt = min(dt_ns, total - a.elapsed_ns)
+
+            t_next = a.elapsed_ns + dt
+            ratio = t_next / total
+
+            self._velocity = tuple(a.v0[i] + a.dv[i] * ratio for i in range(self.dim))
+            self._steering = tuple(a.s0[i] + a.ds[i] * ratio for i in range(self.dim))
+
+            a.elapsed_ns += dt
+            if a.elapsed_ns >= total:
+                self._active_acc = None
+
+            # acc에서는 dt_ns 대신 dt로 실제 적분해야 함
+            dt_ns = dt
+            dt_s = dt_ns * 1e-9
+            note = "acc_step"
+
+        # ----------------------
+        # 1) 실제 상태 적분 (true state)
+        # ----------------------
+        self._step(dt_ns)
+
+        # ----------------------
+        # 2) 센싱은 매 tick마다 (true position 기준)
+        # ----------------------
         if self._sensing_mode and (self._sensor is not None):
-            sensing = self._sensor.sensing(self._position)          # true position에서 센서 측정
-            sensing = self._apply_measurement_noise(sensing)         # (옵션) 가우시안 노이즈
-            self._last_sensing = _vec(self.dim, sensing, "sensing")  # type: ignore
+            sensing = self._sensor.sensing(self._position)
+            sensing = self._apply_measurement_noise(sensing)
+            # self._last_sensing = _vec(self.dim, sensing, "sensing")  # type: ignore
+            self._last_sensing = sensing  # type: ignore
+        else:
+            self._last_sensing = None
+
+        # ----------------------
+        # 3) 추정 상태(est state): predict는 매 tick, update는 주기적으로
+        # ----------------------
+        if self._sensing_mode and self._loc_enabled:
+            # (1) Predict: dead-reckoning
+            if self._motion_model is not None:
+                est_pos, est_ori = self._motion_model.step(
+                    position=self._pos_est,
+                    orientation=self._ori_est,
+                    velocity=self._velocity,
+                    steering=self._steering,
+                    dt_s=dt_s,
+                )
+                self._pos_est = est_pos
+                self._ori_est = est_ori
+            else:
+                self._pos_est = tuple(self._pos_est[i] + self._velocity[i] * dt_s for i in range(self.dim))
+                self._ori_est = tuple(self._ori_est[i] + self._steering[i] * dt_s for i in range(self.dim))
+
+            # (2) Update: N tick마다만 센서로 보정
+            if (not self._loc_predict_only) and self._loc_use_sensor_update and (self._tick_count % self._loc_period == 0):
+                if self._last_sensing is not None and self._sensor is not None:
+                    self._pos_est = self._localize_grid_by_circle_scan(self._last_sensing)
+
+                    # 센싱 후 추정 시 스냅샷 출력
+                    print(f"[Tick {self._tick_count}] t={self._time_ns}ns, pos={self._position}, est_pos={self._pos_est}, vel={self._velocity}, steer={self._steering}")
+
+        # 5) 충돌 판정
+        # ----------------------
+        if self._sensor is not None and self._last_sensing is not None:
+            if self.is_collision():
+                self._collision_detected = True
+                self._snapshot(note="collision_detected")
 
 
-        # 진행중 acc가 없으면 그냥 유지하며 step
-        if self._active_acc is None:
-            self._step(dt_ns, note="hold")
-            return
+        # ----------------------
+        # 4) snapshot 기록 (요청한 모든 항목이 여기서 한 번에 저장됨)
+        # ----------------------
 
-        a = self._active_acc
-        total = a.total_ns
+        # 기록
+        self._snapshot(note=note)
+        
 
-        # 마지막 조각(예: 40ms)을 위해 남은 시간만큼만 수행
-        dt = min(dt_ns, total - a.elapsed_ns)
-
-        # 이번 tick 끝 시점의 ratio로 선형 보간
-        t_next = a.elapsed_ns + dt
-        ratio = t_next / total
-
-        self._velocity = tuple(a.v0[i] + a.dv[i] * ratio for i in range(self.dim))
-        self._steering = tuple(a.s0[i] + a.ds[i] * ratio for i in range(self.dim))
-
-        self._step(dt, note="acc_step")
-        a.elapsed_ns += dt
-
-        # acc 끝났으면 해제
-        if a.elapsed_ns >= total:
-            self._active_acc = None
 
     # ----------------------
     # simulation core
@@ -387,12 +464,15 @@ class Moblie_robot:
             }
         )
 
-    def _step(self, dt_ns: int, note: str = "") -> None:
-        """dt_ns만큼 상태 적분."""
+    def _step(self, dt_ns: int) -> None:
+        """
+        ✅ dt_ns 만큼 '실제 상태(true state)'만 적분하는 함수.
+        - 여기서는 물리 적분 + 시간 증가만 수행한다.
+        - 센싱/로컬라이제이션/스냅샷은 _tick()에서 처리한다. (tick 기반 설계)
+        """
         dt_s = dt_ns * 1e-9
-        
-        print(f"tick {self._tick_count}: dt_ns={dt_ns}, dt_s={dt_s}")
-        # ✅ motion model이 있으면 그걸로 position/orientation 갱신
+
+        # 실제(true) 상태 적분
         if self._motion_model is not None:
             new_pos, new_ori = self._motion_model.step(
                 position=self._position,
@@ -404,49 +484,12 @@ class Moblie_robot:
             self._position = new_pos
             self._orientation = new_ori
         else:
-            # 기존 방식(각 성분별 Euler)
+            # 기존 Euler 적분
             self._position = tuple(self._position[i] + self._velocity[i] * dt_s for i in range(self.dim))
             self._orientation = tuple(self._orientation[i] + self._steering[i] * dt_s for i in range(self.dim))
 
+        # 시간 누적
         self._time_ns += dt_ns
-
-        # ✅ (localization) predict-update 구조
-        # 1) predict: 매 tick마다 제어(velocity/steering)로 추정 상태 적분
-        # 2) update : N틱마다만 센서 측정으로 보정(그리드 매칭)
-        if self._sensing_mode and self._loc_enabled:
-            # (테스트 모드면 "정답"을 안다고 가정 -> 추정치도 true로 맞춰둠)
-            if getattr(self, "_test_map_mode", False):
-                self._pos_est = self._position
-                self._ori_est = self._orientation
-            else:
-                # --- 1) Predict (dead-reckoning) ---
-                if self._motion_model is not None:
-                    # motion model이 있으면 동일 모델로 "추정 상태"도 예측
-                    est_pos, est_ori = self._motion_model.step(
-                        position=self._pos_est,
-                        orientation=self._ori_est,
-                        velocity=self._velocity,
-                        steering=self._steering,
-                        dt_s=dt_s,
-                    )
-                    self._pos_est = est_pos
-                    self._ori_est = est_ori
-                else:
-                    # Euler 적분(간단 버전)
-                    self._pos_est = tuple(self._pos_est[i] + self._velocity[i] * dt_s for i in range(self.dim))
-                    self._ori_est = tuple(self._ori_est[i] + self._steering[i] * dt_s for i in range(self.dim))
-
-                # --- 2) Update (measurement correction) ---
-                # 센서 update가 켜져 있고, 이번 tick이 period에 해당하면 그리드 매칭으로 보정
-                if (not self._loc_predict_only) and self._loc_use_sensor_update and (self._tick_count % self._loc_period == 0):
-                    if self._last_sensing is not None:
-                        self._pos_est = self._localize_grid_by_circle_scan(self._last_sensing)
-#debug
-                        print(f"real pos: {self._position}, est pos(before update): {self._pos_est}")
-                        # NOTE: 지금은 (x,y)만 보정. orientation은 predict로만 유지.
-                        # 나중에 EKF/Particle에서는 measurement update로 orientation도 함께 업데이트 가능.
-
-        self._snapshot(note=note)
 
     def step_queue_with_model(self, model, dt_ns: int = None) -> bool:
         """
@@ -551,7 +594,7 @@ class Moblie_robot:
             self._steering = tuple(s0[i] + ds[i] * ratio for i in range(self.dim))
 
             elapsed += dt
-            self._step(dt, note="acc")
+            self._tick(dt, note="acc_step")
 
     def is_collision(self) -> bool:
         """현재 위치에서 센서로 충돌 판정."""
@@ -726,14 +769,18 @@ class Moblie_robot:
         if dt_ns is None:
             dt_ns = self._update_rate_ns
 
-        # 테스트 맵 모드 확인
-        if not self._test_map_mode or self._test_SlamMap is None:
+        
+        # ✅ replanning A*는 "센서가 가진 slam_map"을 사용한다.
+        # (테스트용으로 map만 따로 들고 있던 _test_map_mode/_test_SlamMap은 삭제됨)
+        # print(self._sensor)
+        sensor_map = self._sensor.get_map() if self._sensor is not None else None
+        if (self._sensor is None) or sensor_map is None:
             raise RuntimeError(
-                "테스트 맵 모드가 아니거나, 테스트 SlamMap이 설정되지 않았습니다. "
-                "set_test_map_mode(True, map)를 먼저 호출하세요."
+                "A* replanning을 하려면 sensor와 sensor._slam_map이 필요합니다. "
+                "Circle_Sensor(dim, ..., slam_map=...) 형태로 센서를 먼저 설정하세요."
             )
 
-        slam_map = self._test_SlamMap
+        slam_map = sensor_map
 
         # goal 결정 우선순위:
         # 1) robot이 들고 있는 end_point
@@ -804,6 +851,11 @@ class Moblie_robot:
                 heading_gain=heading_gain,
                 look_ahead=look_ahead,
             )
+
+            # 충돌 시 즉시 종료
+            if self._collision_detected:
+                break
+
 
             # 4) 목표 도달 체크
             gx, gy = goal[0], goal[1]
@@ -905,7 +957,7 @@ class Moblie_robot:
             self._steering = (float(steer), 0.0)
 
             # 7) 1 tick 적분
-            self._step(dt_ns, note="dynamic_control")
+            self._tick(dt_ns, note="dynamic_control")
 
             # 8) goal 체크
             gx, gy = goal[0], goal[1]
@@ -1293,7 +1345,7 @@ class Moblie_robot:
             tx, ty = path[look_idx]
             target_theta = math.atan2(ty - y, tx - x)
 
-            cur_theta = self._orientation[0]
+            cur_theta = self.get_orientation()[0]
             heading_err = _wrap_pi(target_theta - cur_theta)  # -pi~pi로 정규화
             steer_heading = heading_gain * heading_err
 
@@ -1306,9 +1358,10 @@ class Moblie_robot:
         self._velocity = (float(v_ref), 0.0)
         self._steering = (float(steer), 0.0)
 
-        # 7) 모델 설정 + 1 tick 적분
+        # 7) 모델 설정 + 1 tick 수행 (tick 엔진으로!)
         self.set_motion_model(model)
-        self._step(dt_ns, note="replan_step(dynamic_control)")
+        self._tick(dt_ns, note="replan_step(dynamic_control)")
+
 
     def _snap_to_grid_center(self, pos, resolution: float, center_offset: float = 0.5):
         """
@@ -1364,12 +1417,21 @@ class Moblie_robot:
 
     def _localize_grid_by_circle_scan(self, z_meas) -> Tuple[float, ...]:
         """Circle_Sensor 측정(z_meas)으로 맵 위 (x,y) 추정."""
+
+        # 페이크 빠른 측정 모드
+        if self._fake_fast_sensing:
+            c_pose = self._position
+            x = random.gauss(c_pose[0], self._fake_fast_sensing_sigma)
+            y = random.gauss(c_pose[1], self._fake_fast_sensing_sigma)
+            return (x, y)
+        
         if self._sensor is None:
             return self._pos_est
-        slam_map = getattr(self._sensor, "_slam_map", None)
+        slam_map = self._sensor.get_map()
         if slam_map is None or getattr(slam_map, "limit", None) is None:
             return self._pos_est
-
+        
+        print("Localizing...")
         (x0, y0), (x1, y1) = slam_map.limit
         res = self._loc_resolution
         nx = int(math.ceil((x1 - x0) / res))
@@ -1400,21 +1462,6 @@ class Moblie_robot:
 
         return best_xy
 
-    #더 이상 사용 안함 아까워서 남겨둠
-    def _update_estimated_pose(self) -> None:
-        """(true position에서) 센서 측정 -> 맵 매칭으로 추정 위치 갱신"""
-        # print("Updating estimated pose...")
-        if not self._sensing_mode or self._sensor is None:
-            self._pos_est = self._position
-            return
-        if getattr(self, "_test_map_mode", False):
-            self._pos_est = self._position
-            return
-        z = self._sensor.sensing(self._position)
-        self._last_sensing = z
-        self._pos_est = self._localize_grid_by_circle_scan(z)
-        print("real position:", self._position, "sensing:", z, "estimated position:", self._pos_est)
-
     #----------------------
     # localization, noize
     #----------------------
@@ -1440,3 +1487,63 @@ class Moblie_robot:
             else:
                 out.append(float(v) + random.gauss(0.0, self._meas_noise_sigma))
         return out
+
+    #----------------------
+    # 칼만 필터
+    #----------------------
+    def _ekf_sync_to_est(self) -> None:
+        """EKF 상태 -> (pos_est, ori_est)로 반영"""
+        x, y, th = float(self._ekf_x[0]), float(self._ekf_x[1]), float(self._ekf_x[2])
+        self._pos_est = (x, y)
+        # orientation이 (theta, 0.0) 같은 형태라면 첫 축만 갱신
+        self._ori_est = (th,) + tuple(0.0 for _ in range(self.dim - 1))
+
+    def _ekf_predict(self, dt_s: float) -> None:
+        """제어(velocity/steering)로 예측 단계"""
+        if not self._ekf_enabled:
+            return
+
+        x, y, th = self._ekf_x
+        v = float(self._velocity[0]) if len(self._velocity) > 0 else 0.0
+        w = float(self._steering[0]) if len(self._steering) > 0 else 0.0
+
+        # 비선형 상태전이
+        nx = x + v * math.cos(th) * dt_s
+        ny = y + v * math.sin(th) * dt_s
+        nth = th + w * dt_s
+        self._ekf_x = np.array([nx, ny, nth], dtype=float)
+
+        # Jacobian F = df/dx
+        F = np.array([
+            [1.0, 0.0, -v * math.sin(th) * dt_s],
+            [0.0, 1.0,  v * math.cos(th) * dt_s],
+            [0.0, 0.0,  1.0],
+        ], dtype=float)
+
+        self._ekf_P = F @ self._ekf_P @ F.T + self._ekf_Q
+        self._ekf_sync_to_est()
+
+    def _ekf_update_xy(self, z_xy: Tuple[float, float]) -> None:
+        """측정 z=(x,y)로 update 단계"""
+        if not self._ekf_enabled:
+            return
+
+        z = np.array([float(z_xy[0]), float(z_xy[1])], dtype=float)
+
+        H = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ], dtype=float)
+
+        x = self._ekf_x
+        P = self._ekf_P
+
+        y = z - (H @ x)                        # innovation
+        S = H @ P @ H.T + self._ekf_R          # innovation cov
+        K = P @ H.T @ np.linalg.inv(S)         # Kalman gain
+
+        self._ekf_x = x + K @ y
+        I = np.eye(3, dtype=float)
+        self._ekf_P = (I - K @ H) @ P
+
+        self._ekf_sync_to_est()
