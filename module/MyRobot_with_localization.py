@@ -511,12 +511,12 @@ class Moblie_robot:
                         self._gslam_k,
                         lm_id,
                         (rng, bearing),
-                        cov=np.diag([0.5, 0.15]),
+                        cov=np.diag([1.0, 0.5]),
                         lm_init=lm_init,
                     )
 
                 # 4) solve (매 tick은 무거울 수 있으니, 원하면 period로 줄여도 됨)
-                poses, lms = self._gslam.solve(iters=3)
+                poses, lms = self._gslam.solve(iters=1)
 
                 # 5) apply last pose to est
                 if poses:
