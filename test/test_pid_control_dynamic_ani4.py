@@ -148,12 +148,14 @@ def main():
 
     robot.set_test_map_mode(True, m)
 
-    pid = PIDVec(dim=2, kp=5, ki=0.5, kd=0.5, i_limit=1.0)
+    pid = PIDVec(dim=2, kp=2, ki=0.1, kd=0.5, i_limit=1.0)
     robot.set_pid(pid, v_ref=speed)
 
     # 로컬라이제이션 파라미터(로봇 내부에서도 추정치 사용)
-    robot.set_localization_params(resolution=1.0, sigma=0.4, period=5)
+    robot.set_localization_params(resolution=1.0, sigma=0.4, period=1)
     robot.enable_estimated_pose(True)
+
+    robot.set_fake_fast_sensing(True, sigma=0.2)
 
     model = SimpleBicycleModel(wheelbase=1.0)
 

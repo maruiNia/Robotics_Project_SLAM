@@ -16,50 +16,56 @@ from module.MyRobot_with_localization import Moblie_robot
 import numpy as np
 
 
-def draw_obstacles(ax, slam_map : MySlam, *, alpha=0.20):
+def draw_obstacles(ax, slam_map: MySlam, *, alpha=0.20):
+    """기존 파일과 동일: SlamMap의 장애물을 사각형으로 표시"""
     for obs in slam_map.get_obs_list():
         (min_x, min_y), (max_x, max_y) = obs.bounds()
         ax.add_patch(Rectangle((min_x, min_y), max_x - min_x, max_y - min_y, alpha=alpha))
 
 
+def grid_center_xy(cell_xy, cell_size: float):
+    """(grid x,y) -> (world x,y) 중심좌표"""
+    gx, gy = cell_xy
+    return ((gx + 0.5) * cell_size, (gy + 0.5) * cell_size)
+
+
 def main():
     # -------------------------
-    # 1) 맵/센서/로봇 세팅
+    # 1) 맵/센서/로봇 세팅 (원본 최대 유지)
     # -------------------------
     print("맵/센서/로봇 세팅 중...")
-    # maze = [
-    #     [0, 1, 1, 1, 1, 1],
-    #     [0, 1, 0, 0, 0, 1],
-    #     [0, 0, 0, 1, 0, 1],
-    # ]
-    # cell_size = 3
-    # m = maze_map(maze, (0, 0), (4, 2), cell_size=cell_size)
-    # vel = 1.0
 
-    #과제 맵
-    maze = [ ## 0 1  2 3  4  5 6  7  8 9 10 11 12 
-        [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], # 0
-        [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], # 1
-        [0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], # 2
-        [0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1], # 3
-        [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # 4
-        [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0], # 5
-        [0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0], # 6
-        [0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 0], # 7
-        [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0], # 8
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # 9
+    # 과제 맵 (원본 유지)
+    maze = [  # x: 0..12, y: 9..0 (row-major = grid[y][x])
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # 9
+        [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],  # 8
+        [0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 0],  # 7
+        [0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0],  # 6
+        [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0],  # 5
+        [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # 4
+        [0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1],  # 3
+        [0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],  # 2
+        [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],  # 1
+        [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],  # 0
     ]
-    start = (0, 9)
-    end_g1 = (11, 9)
-    end_g2 = (11, 1)
 
+    # grid 좌표
+    start = (0, 9)
+    g1 = (11, 9)
+    g2 = (11, 1)
+
+    # "랜드마크" (grid 좌표) - SLAM 프로젝트 표시용
     land_1 = (2, 6)
     land_2 = (3, 4)
     land_3 = (7, 2)
+    landmarks_grid = [land_1, land_2, land_3]
 
     cell_size = 3
-    m = maze_map(maze, start, end_g1, cell_size=cell_size)
-    vel = 2
+
+    # SlamMap은 end를 하나만 받으므로(원본 유지) 기본 목적지는 g1로 둠
+    m = maze_map(maze, start, g1, cell_size=cell_size)
+
+    v_ref = 2.0
 
     sensor = Circle_Sensor(dim=2, number=10, distance=12.0, slam_map=m, step=0.1)
 
@@ -72,21 +78,31 @@ def main():
         sensor=sensor,
     )
 
+    # planning/control에서 est 쓰기
     robot.enable_estimated_pose(True)
+
+    # scan-grid 기반 absolute pose 측정(=SLAM measurement로 쓰임)
     robot.set_localization_params(resolution=0.2, sigma=0.5, period=1)
+
+    # path tracking PID (원본 유지)
     pid = PIDVec(dim=2, kp=1.5, ki=0.1, kd=0.3)
-    robot.set_pid(pid, v_ref=vel)
+    robot.set_pid(pid, v_ref=v_ref)
 
+    # 센싱 노이즈 (원본 유지)
     robot.set_fake_fast_sensing(True, sigma=0.5)
-    # robot.enable_ekf(True)
-    robot.enable_ekf(False)
-    robot.enable_pgslam(True)
 
+    # -------------------------
+    # ✅ SLAM 모드 선택
+    # - EKF: robot.enable_ekf(True), robot.enable_pgslam(False)
+    # - PoseGraph SLAM: robot.enable_pgslam(True), robot.enable_ekf(False)
+    # -------------------------
+    robot.enable_ekf(False)
+    robot.enable_gslam(True)
 
     model = SimpleBicycleModel(wheelbase=1.2)
 
     # -------------------------
-    # 2) 로봇이 모든 연산을 끝낸 뒤 log 확보 (애니는 log만 사용)
+    # 2) 로봇 실행 및 log 확보 (애니는 log만 사용)
     # -------------------------
     print("로봇 실행 및 로그 확보 중...")
     log = robot.run_replanning_astar_follow(
@@ -95,30 +111,22 @@ def main():
         smooth=True,
         smooth_alpha=0.6,
         smooth_beta=0.3,
-        v_ref=vel,
+        v_ref=v_ref,
         dt_ns=50_000_000,
         goal_tolerance=0.5,
-        max_steps=50,
+        max_steps=2000,          # SLAM 시각화는 좀 길게 보는 게 좋아서 증가
         steer_limit=1.2,
         use_heading_term=True,
         heading_gain=0.6,
-        look_ahead= 6,
+        look_ahead=6,
     )
 
     if not log:
         print("log가 비어있습니다.")
         return
-    
-    for i in range(10):
-        print(f"  log[{i}]: {log[i]}")
-        print('-----------\n')
-    # else:
-        # print(f"log에 {len(log)} 스냅샷이 기록되었습니다.")
-        # for i in range(10):
-        #     print(f"  log[{i}]: {log[i]}")
 
     # -------------------------
-    # 3) log 파싱 (오직 snapshot 값만!)
+    # 3) log 파싱
     # -------------------------
     t_ns = [st["t_ns"] for st in log]
     pos = [st["position"] for st in log]
@@ -129,13 +137,17 @@ def main():
     pathing = [st.get("pathing", None) for st in log]
     note = [st.get("note", "") for st in log]
 
+    # orientation 로그(있으면 heading 화살표 표시)
+    has_ori = ("orientation" in log[0])
+    ori = [st.get("orientation", (0.0, 0.0)) for st in log] if has_ori else None
+
     # -------------------------
     # 4) matplotlib 준비
     # -------------------------
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True)
-    ax.set_title("Replanning A* Follow (log-only animation)")
+    ax.set_title("SLAM Project Animation (Map + True/Est + Sensing)")
 
     if m.limit is not None:
         (x0, y0), (x1, y1) = m.limit
@@ -144,13 +156,25 @@ def main():
 
     draw_obstacles(ax, m, alpha=0.25)
 
-    # start/goal
+    # start / goals (g1,g2 둘 다 표시)
     sx, sy = m.start_point
-    gx, gy = m.end_point
-    ax.plot([sx], [sy], "bs", markersize=8, label="Start")
-    ax.plot([gx], [gy], "g^", markersize=8, label="Goal")
+    g1x, g1y = grid_center_xy(g1, cell_size)
+    g2x, g2y = grid_center_xy(g2, cell_size)
 
-    # path(현재 tick)
+    ax.plot([sx], [sy], "bs", markersize=8, label="Start")
+    ax.plot([g1x], [g1y], "g^", markersize=8, label="Goal g1 (active)")
+    ax.plot([g2x], [g2y], "c^", markersize=8, label="Goal g2")
+
+    # landmarks (노란 다이아)
+    lmx = []
+    lmy = []
+    for lm in landmarks_grid:
+        wx, wy = grid_center_xy(lm, cell_size)
+        lmx.append(wx)
+        lmy.append(wy)
+    ax.scatter(lmx, lmy, marker="D", s=60, label="Landmarks (display only)")
+
+    # path (현재 tick)
     path_line, = ax.plot([], [], "r-", linewidth=2, label="pathing (from log)")
 
     # true/est trace
@@ -161,28 +185,20 @@ def main():
     true_pt, = ax.plot([], [], "bo", markersize=6, label="true pos")
     est_pt,  = ax.plot([], [], "mo", markersize=6, label="est pos")
 
-    # velocity arrow (quiver)
+    # velocity arrow
     vel_q = ax.quiver([pos[0][0]], [pos[0][1]], [0], [0], angles="xy", scale_units="xy", scale=1)
 
-    # steering/heading arrow: 여기서는 "orientation 로그"가 있으면 그걸로,
-    # 없으면 steering[0] 적분한 추정 heading을 내부에서 만들어도 되지만,
-    # 요청이 "log only"라서 orientation이 있으면 사용하고 없으면 화살표 생략.
-    has_ori = ("orientation" in log[0])
-    ori = [st.get("orientation", (0.0, 0.0)) for st in log] if has_ori else None
+    # heading arrow
     head_q = ax.quiver([pos[0][0]], [pos[0][1]], [0], [0], angles="xy", scale_units="xy", scale=1)
 
-    # ---- 센싱 시각화(2번째 방식: 레이 + 끝점 점 + hit이면 X) ----
+    # ---- sensing rays ----
     N = sensor.get_number()
     max_range = sensor.get_distance()
 
-    # 레이 라인 N개
     ray_lines = [ax.plot([], [], alpha=0.25, linewidth=1)[0] for _ in range(N)]
-    # 끝점 점 N개
     end_pts = [ax.plot([], [], ".", alpha=0.25)[0] for _ in range(N)]
-    # hit X는 한 번에 scatter로 갱신
     hit_sc = ax.scatter([], [], marker="x", s=40)
 
-    # 텍스트 HUD (실시간 상태 표시)
     hud = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top", fontsize=10)
 
     ax.legend(loc="upper left")
@@ -199,8 +215,8 @@ def main():
             ln.set_data([], [])
         for pt in end_pts:
             pt.set_data([], [])
-        hit_sc.set_offsets([[0.0, 0.0]])   # 임시 1점
-        hit_sc.set_alpha(0.0)              # 안 보이게
+
+        hit_sc.set_offsets(np.empty((0, 2)))
 
         vel_q.set_offsets([pos[0][0], pos[0][1]])
         vel_q.set_UVC(0.0, 0.0)
@@ -211,14 +227,13 @@ def main():
         return [path_line, true_trace, est_trace, true_pt, est_pt, vel_q, head_q, hit_sc, hud] + ray_lines + end_pts
 
     def update(i):
-        # --- 현재 상태 ---
         x, y = pos[i][0], pos[i][1]
         ex, ey = (est[i][0], est[i][1]) if est[i] is not None else (x, y)
 
         vx, vy = vel[i][0], vel[i][1]
         s0 = steer[i][0] if steer[i] is not None else 0.0
 
-        # --- trace / point ---
+        # traces
         true_trace.set_data([p[0] for p in pos[:i+1]], [p[1] for p in pos[:i+1]])
         est_trace.set_data([p[0] for p in est[:i+1] if p is not None],
                            [p[1] for p in est[:i+1] if p is not None])
@@ -226,7 +241,7 @@ def main():
         true_pt.set_data([x], [y])
         est_pt.set_data([ex], [ey])
 
-        # --- pathing (log에 있는 값 그대로) ---
+        # pathing
         pth = pathing[i]
         if pth is not None and len(pth) >= 2:
             px = [p[0] for p in pth]
@@ -235,11 +250,11 @@ def main():
         else:
             path_line.set_data([], [])
 
-        # --- velocity arrow ---
+        # velocity arrow
         vel_q.set_offsets([x, y])
         vel_q.set_UVC(vx, vy)
 
-        # --- heading arrow (가능하면 orientation 로그 기반) ---
+        # heading arrow
         head_q.set_offsets([x, y])
         if has_ori:
             th = ori[i][0]
@@ -248,12 +263,11 @@ def main():
         else:
             head_q.set_UVC(0.0, 0.0)
 
-        # --- sensing rays (2번째 방식 그대로) ---
+        # sensing rays
         z = sensing[i]
         hit_xy = []
 
         if z is None:
-            # 센싱 없으면 모두 비움
             for ln in ray_lines:
                 ln.set_data([], [])
             for pt in end_pts:
@@ -268,18 +282,15 @@ def main():
                 ex2 = x + math.cos(angle) * d
                 ey2 = y + math.sin(angle) * d
 
-                # 레이
                 ray_lines[k].set_data([x, ex2], [y, ey2])
-                # 끝점 점
                 end_pts[k].set_data([ex2], [ey2])
 
-                # hit이면 X 좌표로 모음
                 if dist is not None:
                     hit_xy.append([ex2, ey2])
 
             hit_sc.set_offsets(hit_xy)
 
-        # --- HUD 텍스트(실시간 전체 표시) ---
+        # HUD
         hud.set_text(
             f"step={i}/{len(log)-1}\n"
             f"note={note[i]}\n"
@@ -289,7 +300,8 @@ def main():
             f"v=({vx:.2f},{vy:.2f})  |v|={math.hypot(vx,vy):.2f}\n"
             f"steer(w)={s0:.3f} rad/s\n"
             f"sensing={'ON' if z is not None else 'None'}  rays={N}\n"
-            f"pathing={'ON' if pth is not None else 'None'}"
+            f"pathing={'ON' if pth is not None else 'None'}\n"
+            f"SLAM={'PGSLAM' if True else 'EKF'}"
         )
 
         return [path_line, true_trace, est_trace, true_pt, est_pt, vel_q, head_q, hit_sc, hud] + ray_lines + end_pts

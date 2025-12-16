@@ -10,6 +10,9 @@ from .MyUtils import _vec, _check_dim, _wrap_pi
 from .MySlam import SlamMap
 from .MyNavi import astar_find_path_center_nodes, euclidean
 from .MyGraphSlam import PoseGraphSLAM2D
+from .MyGraphSlam_Landmark import GraphSLAM2D
+# (만약 기존에 from module.MyGraphSlam import PoseGraphSLAM2D 가 있으면 지워도 됨)
+
 
 from collections import deque
 import math
@@ -130,11 +133,16 @@ class Moblie_robot:
         self._prev_replan_path = None        # 이전 tick에서 사용한 path
         self._prev_replan_seg = 0            # 이전 tick의 진행 seg index(뒤로 점프 방지)
 
-        #Graph-SLAM 관련
+        #pose Graph-SLAM 관련
         self._pgslam_enabled = False
         self._pgslam = PoseGraphSLAM2D(prior_info=1e6)
         self._pgslam_k = -1  # current pose node index
         self._pgslam_last_est = None  # last optimized pose (x,y)
+
+        #Graph-SLAM 관련
+        self._pgslam = GraphSLAM2D(prior_info=1e6)
+        self._pgslam_enabled = False
+        self._pgslam_k = -1
 
         # 동적 명령 처리
         self._path = None #추적할 경로
@@ -188,7 +196,10 @@ class Moblie_robot:
 
     def enable_pgslam(self, flag: bool = True):
         self._pgslam_enabled = flag
-        
+
+    def enable_gslam(self, flag: bool = True):
+        self._gslam_enabled = flag
+
     # ----------------------
     # getters
     # ----------------------
@@ -433,7 +444,58 @@ class Moblie_robot:
 
                         print(f"[Tick {self._tick_count}] EKF update "
                             f"true={self._position}, est={self._pos_est}, z={z_xy} ")
+            elif self._pgslam_enabled:
+                # 1) 그래프 시작 (첫 pose 고정)
+                if self._pgslam_k < 0:
+                    self._pgslam.add_first_pose(self._pos_est)
+                    self._pgslam_k = 0
+                else:
+                    # 2) 새 pose 노드 추가
+                    k_prev = self._pgslam_k
+                    k = self._pgslam.add_pose()
+                    self._pgslam_k = k
 
+                    # 3) 오도메트리 엣지
+                    v = float(self._velocity[0])
+                    theta = float(self._ori_est[0])
+                    dx = v * math.cos(theta) * dt_s
+                    dy = v * math.sin(theta) * dt_s
+                    self._pgslam.add_odometry(k_prev, k, (dx, dy), var=0.05)
+
+                # 4) 랜드마크 관측 엣지 추가
+                for lm_id, dist in self._observe_landmarks():
+                    self._pgslam.observe_landmark(
+                        self._pgslam_k,
+                        lm_id,
+                        dist,
+                        var=0.5
+                    )
+
+                # 5) solve → 마지막 pose 반영
+                poses, lms = self._pgslam.solve()
+                if poses:
+                    self._pos_est = poses[-1]
+            elif self._pgslam_enabled: #✅ Graph-SLAM 경로
+                if self._pgslam_k < 0:
+                    self._pgslam.add_first_pose(self._pos_est)
+                    self._pgslam_k = 0
+                else:
+                    k_prev = self._pgslam_k
+                    k = self._pgslam.add_pose()
+                    self._pgslam_k = k
+
+                    v = float(self._velocity[0])
+                    theta = float(self._ori_est[0])
+                    dx = v * math.cos(theta) * dt_s
+                    dy = v * math.sin(theta) * dt_s
+                    self._pgslam.add_odometry(k_prev, k, (dx, dy), var=0.05)
+
+                for lm_id, dist in self._observe_landmarks():
+                    self._pgslam.observe_landmark(self._pgslam_k, lm_id, dist, var=0.5)
+
+                poses, lms = self._pgslam.solve()
+                if poses:
+                    self._pos_est = poses[-1]
             else:
                 # ✅ 기존 경로: dead-reckoning
                 if self._motion_model is not None:
@@ -1584,4 +1646,34 @@ class Moblie_robot:
         '''
         self._pos_est = tuple(self._ekf_x[0:2])
         self._ori_est = (self._ekf_x[2],)
+
+    #----------------------
+    # slam
+    #----------------------
+    # 예시: sensing 결과에서 landmark 거리만 뽑기
+    def _observe_landmarks(self):
+        """
+        landmark 관측: (lm_id, dist) 리스트 반환
+        - 맵은 로봇이 아니라 sensor가 들고 있으므로 self._sensor.get_map()에서 꺼냄
+        - slam_map에 landmarks가 없으면(= 지금 MySlam.SlamMap 기본에는 없음) 그냥 빈 관측 반환
+        """
+        if self._sensor is None:
+            return []
+
+        slam_map = self._sensor.get_map()  # ✅ Circle_Sensor가 들고 있는 맵 :contentReference[oaicite:1]{index=1}
+        if slam_map is None:
+            return []
+
+        landmarks = getattr(slam_map, "landmarks", None)
+        if not landmarks:
+            # landmarks 속성이 없거나 비어있으면: 랜드마크 SLAM 관측은 스킵
+            return []
+
+        obs = []
+        px, py = float(self.get_true_position()[0]), float(self.get_true_position()[1])  # true 기준(원하면 get_position로)
+        for lm_id, lm_pos in landmarks.items():
+            lx, ly = float(lm_pos[0]), float(lm_pos[1])
+            d = ((lx - px)**2 + (ly - py)**2) ** 0.5
+            obs.append((lm_id, d))
+        return obs
 
