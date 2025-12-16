@@ -10,7 +10,8 @@ from .MyUtils import _vec, _check_dim, _wrap_pi
 from .MySlam import SlamMap
 from .MyNavi import astar_find_path_center_nodes, euclidean
 from .MyGraphSlam import PoseGraphSLAM2D
-from .MyGraphSlam_Landmark import GraphSLAM2D
+from module.MyGraphSlam_Landmark import GraphSLAM_SE2
+
 # (만약 기존에 from module.MyGraphSlam import PoseGraphSLAM2D 가 있으면 지워도 됨)
 
 
@@ -139,10 +140,13 @@ class Moblie_robot:
         self._pgslam_k = -1  # current pose node index
         self._pgslam_last_est = None  # last optimized pose (x,y)
 
-        #Graph-SLAM 관련
-        self._pgslam = GraphSLAM2D(prior_info=1e6)
-        self._pgslam_enabled = False
-        self._pgslam_k = -1
+        # ----------------------
+        # GraphSLAM (SE2 + landmarks)
+        # ----------------------
+        self._gslam_enabled = False
+        self._gslam = GraphSLAM_SE2(prior_info=1e6)
+        self._gslam_k = -1  # current pose index in graph
+        self._slam_lms_est = {}  # last estimated landmarks {id:(x,y)}
 
         # 동적 명령 처리
         self._path = None #추적할 경로
@@ -475,27 +479,53 @@ class Moblie_robot:
                 poses, lms = self._pgslam.solve()
                 if poses:
                     self._pos_est = poses[-1]
-            elif self._pgslam_enabled: #✅ Graph-SLAM 경로
-                if self._pgslam_k < 0:
-                    self._pgslam.add_first_pose(self._pos_est)
-                    self._pgslam_k = 0
+            elif self._gslam_enabled: #graph SLAM (SE2 + landmarks)
+                # 1) graph init
+                if self._gslam_k < 0:
+                    # first pose: use current estimate as initial
+                    self._gslam.add_first_pose(self._pos_est, theta0=float(self._ori_est[0]))
+                    self._gslam_k = 0
                 else:
-                    k_prev = self._pgslam_k
-                    k = self._pgslam.add_pose()
-                    self._pgslam_k = k
+                    k_prev = self._gslam_k
+                    k = self._gslam.add_pose()
+                    self._gslam_k = k
 
+                    # 2) odometry factor (use estimated control)
+                    # 여기서는 "월드 프레임에서의 dx,dy" + "dtheta"를 사용
                     v = float(self._velocity[0])
-                    theta = float(self._ori_est[0])
-                    dx = v * math.cos(theta) * dt_s
-                    dy = v * math.sin(theta) * dt_s
-                    self._pgslam.add_odometry(k_prev, k, (dx, dy), var=0.05)
+                    theta_est = float(self._ori_est[0])
+                    dx = v * math.cos(theta_est) * dt_s
+                    dy = v * math.sin(theta_est) * dt_s
+                    dtheta = float(self._steering[0]) * dt_s  # steer를 yaw rate로 쓰는 구조라면
 
-                for lm_id, dist in self._observe_landmarks():
-                    self._pgslam.observe_landmark(self._pgslam_k, lm_id, dist, var=0.5)
+                    self._gslam.add_odometry(k_prev, k, (dx, dy, dtheta), cov=np.diag([0.05, 0.05, 0.02]))
 
-                poses, lms = self._pgslam.solve()
+                # 3) landmark obs factors
+                for lm_id, rng, bearing in self._observe_landmarks_rb():
+                    # optional init guess for landmark (from current est pose + measurement)
+                    ex, ey = float(self._pos_est[0]), float(self._pos_est[1])
+                    eth = float(self._ori_est[0])
+                    lm_init = (ex + rng * math.cos(eth + bearing), ey + rng * math.sin(eth + bearing))
+
+                    self._gslam.observe_landmark_rb(
+                        self._gslam_k,
+                        lm_id,
+                        (rng, bearing),
+                        cov=np.diag([0.5, 0.15]),
+                        lm_init=lm_init,
+                    )
+
+                # 4) solve (매 tick은 무거울 수 있으니, 원하면 period로 줄여도 됨)
+                poses, lms = self._gslam.solve(iters=3)
+
+                # 5) apply last pose to est
                 if poses:
-                    self._pos_est = poses[-1]
+                    lx, ly, lth = poses[-1]
+                    self._pos_est = (lx, ly)
+                    self._ori_est = (lth,)
+
+                # 6) keep landmarks for logging/animation
+                self._slam_lms_est = lms
             else:
                 # ✅ 기존 경로: dead-reckoning
                 if self._motion_model is not None:
@@ -540,18 +570,19 @@ class Moblie_robot:
     # ----------------------
     # simulation core
     # ----------------------
-    def _snapshot(self, note: str = "", pathing = None) -> None:
+    def _snapshot(self, note: str = "", pathing=None) -> None:
         self._log.append(
             {
                 "t_ns": self._time_ns,
-                "position": self._position,              # true position
-                "est_position": self._pos_est,            # ✅ estimated position
+                "position": self._position,
+                "est_position": self._pos_est,
                 "velocity": self._velocity,
                 "steering": self._steering,
                 "orientation": self._orientation,
-                "est_orientation": self._ori_est,         # ✅ (확장 대비)
-                "sensing": self._last_sensing,             # ✅ 마지막 센싱
+                "est_orientation": self._ori_est,
+                "sensing": self._last_sensing,
                 "pathing": pathing,
+                "slam_landmarks": getattr(self, "_slam_lms_est", {}),
                 "note": note,
             }
         )
@@ -1676,4 +1707,44 @@ class Moblie_robot:
             d = ((lx - px)**2 + (ly - py)**2) ** 0.5
             obs.append((lm_id, d))
         return obs
+    
+    def _observe_landmarks_rb(self):
+        """
+        return list[(lm_id, range, bearing)]
+        bearing is relative to robot heading (theta): atan2 - theta.
+        """
+        if self._sensor is None:
+            return []
+
+        slam_map = self._sensor.get_map()
+        if slam_map is None:
+            return []
+
+        landmarks = getattr(slam_map, "landmarks", None)
+        if not landmarks:
+            return []
+
+        # "측정" 생성은 true pose 기준(시뮬레이션)
+        px, py = float(self._position[0]), float(self._position[1])
+        theta = float(self._orientation[0])  # true heading
+
+        obs = []
+        for lm_id, (lx, ly) in landmarks.items():
+            lx, ly = float(lx), float(ly)
+            dx = lx - px
+            dy = ly - py
+            rng = math.hypot(dx, dy)
+
+            # relative bearing
+            bearing = (math.atan2(dy, dx) - theta)
+            # wrap
+            bearing = (bearing + math.pi) % (2 * math.pi) - math.pi
+
+            # 원하면 range 제한/가시성 조건을 추가 가능:
+            # if rng > self._sensor.get_distance(): continue
+
+            obs.append((int(lm_id), float(rng), float(bearing)))
+
+        return obs
+
 
