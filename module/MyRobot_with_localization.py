@@ -9,7 +9,7 @@ from .MyControl import MotionModel, SimpleBicycleModel
 from .MyUtils import _vec, _check_dim, _wrap_pi
 from .MySlam import SlamMap
 from .MyNavi import astar_find_path_center_nodes, euclidean
-from .MyGraphSlam import PoseGraphSLAM2D
+# from .MyGraphSlam import PoseGraphSLAM2D
 
 from collections import deque
 import math
@@ -132,7 +132,7 @@ class Moblie_robot:
 
         #Graph-SLAM 관련
         self._pgslam_enabled = False
-        self._pgslam = PoseGraphSLAM2D(prior_info=1e6)
+        # self._pgslam = PoseGraphSLAM2D(prior_info=1e6)
         self._pgslam_k = -1  # current pose node index
         self._pgslam_last_est = None  # last optimized pose (x,y)
 
