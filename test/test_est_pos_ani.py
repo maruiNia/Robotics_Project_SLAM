@@ -78,8 +78,9 @@ def main():
     robot.set_pid(pid, v_ref=vel)
 
     robot.set_fake_fast_sensing(True, sigma=0.1)
-    robot.enable_ekf(True)
+    # robot.enable_ekf(True)
     # robot.enable_ekf(False)
+    robot.set_loc_mode("ekf")
 
     model = SimpleBicycleModel(wheelbase=1.2)
 
@@ -300,8 +301,9 @@ def main():
         blit=False,
         repeat=False
     )
-
-    plt.show()
+    
+    ani.save("test_est_pos.gif", writer="pillow", fps=20)
+    # plt.show()
 
 
 if __name__ == "__main__":

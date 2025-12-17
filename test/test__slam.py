@@ -289,7 +289,7 @@ def make_log():
     end_g2 = (11, 1)
 
     # ✅ 테스트 랜드마크(셀 좌표)
-    land_cells = [(2, 6), (3, 4), (7, 2), (9, 8), (10, 3)]
+    land_cells = [(2, 6), (3, 4), (7, 2), (9, 8)]
     cell_size = 5
 
     m = maze_map(maze, start, end_g2, cell_size=cell_size)
