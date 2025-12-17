@@ -57,7 +57,7 @@ def main():
     land_2 = (3, 4)
     land_3 = (7, 2)
 
-    cell_size = 3
+    cell_size = 5
     m = maze_map(maze, start, end_g2, cell_size=cell_size)
     vel = 2
 
@@ -77,7 +77,7 @@ def main():
     pid = PIDVec(dim=2, kp=1.5, ki=0.1, kd=0.3)
     robot.set_pid(pid, v_ref=vel)
 
-    robot.set_fake_fast_sensing(True, sigma=0.5)
+    robot.set_fake_fast_sensing(True, sigma=0.1)
     robot.enable_ekf(True)
     # robot.enable_ekf(False)
 
